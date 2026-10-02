@@ -41,7 +41,7 @@ apscheduler 只当调度器：
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from random import randint
 import time
 from typing import TYPE_CHECKING, Final
@@ -90,6 +90,25 @@ _RETRY_DELAY_SECONDS: Final[int] = 60
 _MAX_UNMUTE_ATTEMPTS: Final[int] = 20
 # apscheduler 错过触发时间的容忍窗口（超过就不补跑，交给容灾表下次启动处理）
 _MISFIRE_GRACE_SECONDS: Final[int] = 300
+
+
+def _scheduler_tz() -> tzinfo | None:
+    """取 apscheduler 配置的时区（nonebot-plugin-apscheduler 默认 Asia/Shanghai）。
+
+    ⚠️ 为什么需要它：apscheduler 把**naive** 的 ``run_date`` 按它自己配置的时区
+    本地化。生产机时区恰好在 2026-10-02 就是 Asia/Shanghai（+0800），所以
+    「服务器本地时间」与「调度器时区」一致、看不出问题；但服务器一旦改 UTC
+    或有人调整 ``APSCHEDULER_CONFIG``，naive 时间就会被静默挪动 8 小时
+    —— 那是「解禁要么早 8 小时、要么晚 8 小时」这种只能靠事后复盘发现的故障。
+    统一用带时区的 datetime 就不依赖这个巧合了。
+    """
+    return getattr(scheduler, "timezone", None)
+
+
+def _now() -> datetime:
+    """当前时间（带上调度器时区；调度器没配时区时退回本地时间）。"""
+    tz = _scheduler_tz()
+    return datetime.now(tz) if tz is not None else datetime.now()
 
 
 def pick_mute_minutes(
@@ -177,7 +196,7 @@ def _retry_later(bot_id: str, group_id: int, user_id: int) -> None:
         bot_id,
         group_id,
         user_id,
-        when=datetime.now() + timedelta(seconds=_RETRY_DELAY_SECONDS),
+        when=_now() + timedelta(seconds=_RETRY_DELAY_SECONDS),
     )
 
 
@@ -240,7 +259,7 @@ def _schedule_unmute(
         ban_minutes: 本次禁言的完整时长（抽到的值），用来算「自然到期时刻」。
     """
     _ensure_store()
-    now = datetime.now()
+    now = _now()
     unmute_at = now + timedelta(minutes=minutes)
     expire_at = now + timedelta(minutes=ban_minutes)
 
@@ -292,9 +311,9 @@ async def restore_pending_from_store() -> None:
             cleaned += 1
             continue
 
-        when = datetime.fromtimestamp(unmute_at)
+        when = datetime.fromtimestamp(unmute_at, tz=_scheduler_tz())
         if unmute_at <= now:
-            when = datetime.now()  # 停机期间错过了，立刻补上
+            when = _now()  # 停机期间错过了，立刻补上
             overdue += 1
         else:
             rebuilt += 1

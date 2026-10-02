@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent  # scripts/ 的上一级 = 仓库�
 TARGETS = {
     "__init__": ROOT / "src/plugins/nonebot_plugin_lottery/__init__.py",
     "store": ROOT / "src/plugins/nonebot_plugin_lottery/store.py",
+    "config": ROOT / "src/plugins/nonebot_plugin_lottery/config.py",
 }
 
 ENV_PREFIX = (
@@ -131,7 +132,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M14",
         "启动恢复时把**已错过**的解禁丢掉（不补跑）→ 停机期间该解禁的人被漏掉",
         "__init__",
-        "            when = datetime.now()  # 停机期间错过了，立刻补上\n"
+        "            when = _now()  # 停机期间错过了，立刻补上\n"
         "            overdue += 1",
         "            store.remove_pending(group_id, user_id)\n            continue",
     ),
@@ -146,8 +147,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "M16",
         "恢复时按「现在+阈值」重排，而不是用记录里的**绝对时刻**（越重启越晚）",
         "__init__",
-        "        when = datetime.fromtimestamp(unmute_at)",
-        "        when = datetime.now() + timedelta(minutes=10)",
+        "        when = datetime.fromtimestamp(unmute_at, tz=_scheduler_tz())",
+        "        when = _now() + timedelta(minutes=10)",
     ),
     (
         "M17",
@@ -155,6 +156,34 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "store",
         "    UNIQUE (group_id, user_id)",
         "    UNIQUE (group_id, user_id, unmute_at)",
+    ),
+    (
+        "M18",
+        "恢复时丢掉时区（naive）→ 服务器时区与调度器时区不一致时整体偏移数小时",
+        "__init__",
+        "when = datetime.fromtimestamp(unmute_at, tz=_scheduler_tz())",
+        "when = datetime.fromtimestamp(unmute_at)",
+    ),
+    (
+        "M19",
+        "放弃读取调度器时区 → 又回到「靠服务器本地时区巧合正确」",
+        "__init__",
+        '    return getattr(scheduler, "timezone", None)',
+        "    return None",
+    ),
+    (
+        "M20",
+        "默认上限退回 480（不再是平台最长 2,592,000 秒）",
+        "config",
+        "default=QQ_BAN_MAX_MINUTES,",
+        "default=480,",
+    ),
+    (
+        "M21",
+        "平台边界常量写成「秒」以外的错值 → 分钟换算不再等于 2,592,000 秒",
+        "config",
+        "QQ_BAN_MAX_SECONDS: Final[int] = 2_592_000",
+        "QQ_BAN_MAX_SECONDS: Final[int] = 43_200",
     ),
 ]
 

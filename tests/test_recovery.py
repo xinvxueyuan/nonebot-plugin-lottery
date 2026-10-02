@@ -11,8 +11,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import timezone
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +37,57 @@ def jobs(monkeypatch):
 
     monkeypatch.setattr("nonebot_plugin_lottery._add_unmute_job", fake_add)
     return recorded
+
+
+@pytest.fixture
+def utc_scheduler(monkeypatch):
+    """把调度器时区换成 UTC —— 故意与「服务器本地时区」不一致。
+
+    用来证明重建出的时间是**跟随调度器时区**的绝对值，而不是依赖
+    「服务器本地时区恰好等于 apscheduler 配置的时区」这个巧合。
+    """
+    import nonebot_plugin_lottery as plugin
+
+    fake = SimpleNamespace(timezone=timezone.utc)
+    monkeypatch.setattr(plugin, "scheduler", fake)
+    return fake
+
+
+async def test_restored_datetimes_are_timezone_aware(jobs, tmp_store, utc_scheduler):
+    """重建出的时间必须**带调度器时区**，且绝对时刻与记录一致。
+
+    变异检验对象：把恢复写成 ``datetime.fromtimestamp(unmute_at)``（naive）。
+    naive 时间会被 apscheduler 按它自己的时区本地化 —— 生产机时区恰好是
+    Asia/Shanghai 时看不出问题，一旦服务器改成 UTC 就会整体偏移 8 小时，
+    属于「只能事后复盘才发现」的故障。带时区就没有这个歧义。
+    """
+    now = time.time()
+    store.save_pending(
+        bot_id="3128682634",
+        group_id=1094538078,
+        user_id=10001,
+        unmute_at=now + 37 * 60,
+        expire_at=now + 480 * 60,
+    )
+    store.save_pending(
+        bot_id="3128682634",
+        group_id=1094538078,
+        user_id=10002,
+        unmute_at=now - 120,  # 已错过 → 立刻执行
+        expire_at=now + 480 * 60,
+    )
+
+    await restore_pending_from_store()
+
+    by_user = {j["user_id"]: j["when"] for j in jobs}
+    for uid in (10001, 10002):
+        when = by_user[uid]
+        assert when.tzinfo is not None, f"user={uid} 的时间丢了时区 → 会被本地化挪走"
+        assert when.tzinfo == timezone.utc, f"user={uid} 用的不是调度器时区"
+    assert abs(by_user[10001].timestamp() - (now + 37 * 60)) < 5, (
+        "绝对时刻必须与记录一致"
+    )
+    assert by_user[10002].timestamp() <= time.time() + 2
 
 
 async def test_restore_rebuilds_future_job_at_original_time(jobs, tmp_store):
@@ -82,13 +134,16 @@ async def test_restore_runs_overdue_job_immediately(jobs, tmp_store):
         expire_at=now + 480 * 60,  # 但禁言还没自然到期
     )
 
-    before = datetime.now()
+    before = time.time()
     await restore_pending_from_store()
 
     assert len(jobs) == 1
-    # 必须是「现在」执行，不能是把已经过去的时刻原样交给 apscheduler
-    assert jobs[0]["when"] >= before
-    assert jobs[0]["when"] <= datetime.now()
+    # 必须是「现在」执行，不能是把已经过去的时刻原样交给 apscheduler。
+    # ⚠️ 用 epoch（timestamp）比较，不用 datetime 直接比较：
+    #    run_date 是**带时区**的（跟随调度器时区），datetime.now() 是 naive，
+    #    直接比会 TypeError，而且时区不同的机器上结论也不一样。
+    assert jobs[0]["when"].timestamp() >= before
+    assert jobs[0]["when"].timestamp() <= time.time() + 1
     assert store.count() == 1, "记录不该在重建阶段被删（解禁成功后才删）"
 
 
@@ -131,10 +186,10 @@ async def test_restore_handles_mixed_batch(jobs, tmp_store):
     scheduled = sorted(j["user_id"] for j in jobs)
     assert scheduled == [11, 22], "只该给 ① ② 挂任务"
     assert store.count() == 2, "③ 应被清理，① ② 保留到解禁成功"
-    # ② 是立刻执行，① 在未来
-    by_user = {j["user_id"]: j["when"] for j in jobs}
-    assert by_user[22] <= datetime.now()
-    assert by_user[11] > datetime.now()
+    # ② 是立刻执行，① 在未来（同样用 epoch 比较，避免时区问题）
+    by_user = {j["user_id"]: j["when"].timestamp() for j in jobs}
+    assert by_user[22] <= time.time() + 1
+    assert by_user[11] > time.time()
 
 
 async def test_restore_with_empty_table_schedules_nothing(jobs, tmp_store):

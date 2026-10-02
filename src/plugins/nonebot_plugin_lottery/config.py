@@ -1,21 +1,43 @@
-"""插件配置。"""
+"""插件配置。
+
+## 禁言时长的单位与边界
+
+QQ 群禁言的**平台边界**是以**秒**计的：最短 ``60`` 秒、最长 ``2_592_000`` 秒（30 天）。
+本插件的配置沿用上游真寻插件的习惯，以**分钟**为单位，因此边界写成
+``1 ~ 43_200`` 分钟（= ``60 ~ 2_592_000`` 秒，整除，无舍入）。
+这两个换算关系用 ``QQ_BAN_*`` 常量具名表达，别把裸数字散在代码里 ——
+看到 ``43200`` 不会有人立刻想到「30 天」，看到 ``QQ_BAN_MAX_SECONDS`` 会。
+
+（2026-10-02 用户要求：禁言时长区间按平台真实边界取 ``60 ~ 2_592_000`` 秒。）
+"""
 
 from __future__ import annotations
 
 import logging
+from typing import Final
 
 from nonebot import get_plugin_config
 from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger("nonebot_plugin_lottery")
 
+#: QQ 群禁言的平台边界（**秒**）：最短 60 秒 / 最长 2,592,000 秒（30 天）。
+QQ_BAN_MIN_SECONDS: Final[int] = 60
+QQ_BAN_MAX_SECONDS: Final[int] = 2_592_000
+
+#: 同一组边界的**分钟**表示（本插件配置的单位）：1 / 43,200。
+QQ_BAN_MIN_MINUTES: Final[int] = QQ_BAN_MIN_SECONDS // 60
+QQ_BAN_MAX_MINUTES: Final[int] = QQ_BAN_MAX_SECONDS // 60
+
 
 class Config(BaseModel):
     """抽奖（禁言小助手）插件配置。
 
-    环境变量 ``LOTTERY_MIN_MUTE_TIME``：抽奖禁言最短时间（分钟），默认 1。
+    环境变量 ``LOTTERY_MIN_MUTE_TIME``：抽奖禁言最短时间（分钟），
+    默认 ``1``（= 60 秒，QQ 允许的最短禁言）。
 
-    环境变量 ``LOTTERY_MAX_MUTE_TIME``：抽奖禁言最长时间（分钟），默认 480。
+    环境变量 ``LOTTERY_MAX_MUTE_TIME``：抽奖禁言最长时间（分钟），
+    默认 ``43200``（= 2,592,000 秒 = 30 天，QQ 允许的最长禁言）。
     抽奖时在 ``[MIN, MAX]`` 之间等概率取一个数，**禁言时长就是它**。
 
     环境变量 ``LOTTERY_UNMUTE_AFTER_MINUTES``：超过这个分钟数时，机器人会在
@@ -28,21 +50,24 @@ class Config(BaseModel):
     """
 
     lottery_min_mute_time: int = Field(
-        default=1,
-        ge=1,
-        le=43200,
-        description="抽奖禁言最短时间（分钟）",
+        default=QQ_BAN_MIN_MINUTES,
+        ge=QQ_BAN_MIN_MINUTES,
+        le=QQ_BAN_MAX_MINUTES,
+        description="抽奖禁言最短时间（分钟），默认 1 = 平台最短 60 秒",
     )
     lottery_max_mute_time: int = Field(
-        default=480,
-        ge=1,
-        le=43200,
-        description="抽奖禁言最长时间（分钟）；报出来多少就真禁多久",
+        default=QQ_BAN_MAX_MINUTES,
+        ge=QQ_BAN_MIN_MINUTES,
+        le=QQ_BAN_MAX_MINUTES,
+        description=(
+            "抽奖禁言最长时间（分钟），默认 43200 = 平台最长 2592000 秒；"
+            "报多少就真禁多久"
+        ),
     )
     lottery_unmute_after_minutes: int = Field(
         default=10,
         ge=1,
-        le=43200,
+        le=QQ_BAN_MAX_MINUTES,
         description="禁言超过这个分钟数时，到点由机器人调 API 主动解禁（非禁言封顶）",
     )
     lottery_persist_pending: bool = Field(
@@ -74,4 +99,11 @@ class Config(BaseModel):
 
 plugin_config: Config = get_plugin_config(Config)
 
-__all__ = ["Config", "plugin_config"]
+__all__ = [
+    "QQ_BAN_MAX_MINUTES",
+    "QQ_BAN_MAX_SECONDS",
+    "QQ_BAN_MIN_MINUTES",
+    "QQ_BAN_MIN_SECONDS",
+    "Config",
+    "plugin_config",
+]

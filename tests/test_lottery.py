@@ -22,7 +22,12 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 import pytest
 
 from nonebot_plugin_lottery import pick_mute_minutes, plugin_config
-from nonebot_plugin_lottery.config import Config
+from nonebot_plugin_lottery.config import (
+    QQ_BAN_MAX_MINUTES,
+    QQ_BAN_MAX_SECONDS,
+    QQ_BAN_MIN_SECONDS,
+    Config,
+)
 
 # ── 纯函数：抽时长（不封顶）────────────────────────────────────────
 
@@ -76,12 +81,35 @@ def test_rng_is_called_with_the_configured_bounds():
 # ── 配置：默认值 / 写反了要自动对调 ────────────────────────────────
 
 
-def test_default_config_matches_upstream_plugin():
-    """默认值必须与真寻原插件一致（MIN=1 / MAX=480），解禁阈值 10。"""
+def test_default_range_is_exactly_the_qq_platform_limits():
+    """默认区间必须**正好**是 QQ 平台的真实边界：60 ~ 2,592,000 秒。
+
+    2026-10-02 用户要求「禁言时间阈值改为 60～2,592,000s」。
+    配置单位是**分钟**（沿用上游、也是报给群里看的单位），所以这里
+    同时断言两侧：分钟值与秒值的换算必须整除且相等，
+    光断言 43200 而不断言「= 2,592,000 秒」的话，
+    有人把常量改错（比如写成 43_200 秒）也测不出来。
+    """
     cfg = Config()
     assert cfg.lottery_min_mute_time == 1
-    assert cfg.lottery_max_mute_time == 480
+    assert cfg.lottery_max_mute_time == 43200
     assert cfg.lottery_unmute_after_minutes == 10
+
+    # 换算成秒必须正好等于用户给的边界
+    assert cfg.lottery_min_mute_time * 60 == 60
+    assert cfg.lottery_max_mute_time * 60 == 2_592_000
+
+    # 常量本身也要对（防止有人只改常量或只改默认值）
+    assert QQ_BAN_MIN_SECONDS == 60
+    assert QQ_BAN_MAX_SECONDS == 2_592_000
+    assert QQ_BAN_MAX_MINUTES * 60 == QQ_BAN_MAX_SECONDS
+
+
+def test_mute_bounds_reject_out_of_platform_range():
+    """超出平台边界的值必须被 pydantic 拦下，不能带到 API 调用上。"""
+    for bad in (0, -1, QQ_BAN_MAX_MINUTES + 1):
+        with pytest.raises(ValueError):
+            Config(lottery_max_mute_time=bad)
 
 
 def test_inverted_range_is_swapped_not_raised():
@@ -668,7 +696,7 @@ async def test_unmute_failure_keeps_record_and_reschedules(monkeypatch, tmp_path
     assert store.count() == 1, "失败时记录不能删（否则再也不会重试）"
     assert store.all_pending()[0]["attempts"] == 1
     assert len(rescheduled) == 1, "失败后应重排一次重试"
-    delta = (rescheduled[0]["when"] - datetime.now()).total_seconds()
+    delta = rescheduled[0]["when"].timestamp() - time.time()
     assert 50 <= delta <= 70, f"重试间隔应约 60 秒，实际 {delta}s"
 
 
