@@ -1,0 +1,171 @@
+[project]
+name = "nonebot-plugin-lottery"
+version = "0.1.0"
+description = "抽奖（禁言小助手）：参与抽奖的群员会被随机禁言一段时间；超过上限的定时自动解禁"
+keywords = ["nonebot2", "nonebot", "bot", "lottery", "mute", "group-management"]
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "xinvxueyuan", email = "xinvxueyuan@yeah.net" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Plugins",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications :: Chat",
+]
+dependencies = [
+    "nonebot2>=2.5.0",
+    "nonebot-adapter-onebot>=2.4.6",
+    "nonebot-plugin-apscheduler>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/xinvxueyuan/nonebot-plugin-lottery"
+Repository = "https://github.com/xinvxueyuan/nonebot-plugin-lottery"
+
+[dependency-groups]
+dev = [
+    { include-group = "lint" },
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+lint = [
+    "ruff>=0.16.2",
+    "pyright>=1.1.411",
+]
+
+[tool.nonebot]
+plugin_dirs = ["src/plugins"]
+
+[tool.nonebot.adapters]
+nonebot-adapter-onebot = [
+    { name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" },
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.format]
+line-ending = "lf"
+preview = true
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true
+select = [
+    "F",     # Pyflakes
+    "W",     # pycodestyle warnings
+    "E",     # pycodestyle errors
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "ANN",   # flake8-annotations
+    "ASYNC", # flake8-async
+    "BLE",   # flake8-blind-except
+    "B",     # flake8-bugbear
+    "A",     # flake8-builtins
+    "COM",   # flake8-commas
+    "C4",    # flake8-comprehensions
+    "D",     # pydocstyle
+    "T10",   # flake8-debugger
+    "ICN",   # flake8-import-conventions
+    "PIE",   # flake8-pie
+    "T20",   # flake8-print
+    "Q",     # flake8-quotes
+    "RET",   # flake8-return
+    "SIM",   # flake8-simplify
+    "TID",   # flake8-tidy-imports
+    "TC",    # flake8-type-checking
+    "ARG",   # flake8-unused-arguments
+    "PERF",  # Perflint
+    "PGH",   # pygrep-hooks
+    "FURB",  # refurb
+    "TRY",   # tryceratops
+    "RUF",   # Ruff-specific rules
+]
+ignore = [
+    "E402",    # module-import-not-at-top-of-file  # nonebot2 require() violates this
+    "B008",    # function-call-in-default-argument  # nonebot2 Depends() without Annotated
+    "ANN401",  # any-type
+    "COM812",  # missing-trailing-comma
+    "TID252",  # prefer-absolute-imports (relative imports inside plugin package)
+    "D100",  # missing-module-docstring
+    "D104",  # missing-public-class-docstring
+    "D105",  # missing-magic-method-docstring
+    "D107",  # missing-__init__-docstring
+    "D203",  # one-blank-line-before-class (conflicts with Google convention)
+    "D212",  # multi-line-summary-first-line (conflicts with D213, we want D213)
+    "D400",  # ends-in-period (too strict for CJK content)
+    "D415",  # ends-in-punctuation (too strict for CJK content)
+    "D101",  # missing-public-class-docstring
+    "D102",  # missing-public-method-docstring
+    "D103",  # missing-public-function-docstring
+    "RUF001",  # ambiguous-unicode-character-string (CJK punctuation in Chinese project)
+    "RUF002",  # ambiguous-unicode-character-docstring (CJK punctuation)
+    "RUF003",  # ambiguous-unicode-character-comment (CJK punctuation)
+    "BLE001",  # blind-except (NoneBot API wrappers catch broad Exception deliberately)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "double"
+multiline-quotes = "double"
+docstring-quotes = "double"
+
+[tool.ruff.lint.isort]
+known-first-party = ["nonebot_plugin_lottery"]
+force-sort-within-sections = true
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里刻意用简单写法：替身函数的参数/返回值不写注解、假方法参数不用到、
+# 长错误消息图省事直接写在 raise 里。强制这类地方写全套注解只会让测试更难读。
+"tests/**" = ["ANN", "ARG", "TRY003"]
+# ⚠️ NoneBot 的 handler 签名注解**必须运行时可解析**：依赖注入靠注解去取
+# `Bot` / `GroupMessageEvent`（把类型放进 TYPE_CHECKING 块会让注入静默失败，
+# 且只在生产暴露）。所以 TC002 必须放行，不能"照规范"挪走。
+"src/plugins/nonebot_plugin_lottery/__init__.py" = ["TC002"]
+# 变异检验脚本是**给人看的命令行报告**：print 是它的输出通道（T20 在这里是噪音），
+# 它还要打印状态、写备份文件，所以子进程调用与文件写入都放行。
+"scripts/**" = ["T20", "ANN", "S603", "S607", "RUF001", "RUF002", "RUF003", "E501"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+pythonPlatform = "All"
+typeCheckingMode = "strict"
+reportUnknownVariableType = "none"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownLambdaType = "none"
+reportUnknownParameterType = "none"
+reportMissingTypeArgument = "none"
+reportMissingTypeStubs = "none"
+reportUnusedFunction = "none"
+reportPrivateUsage = "none"
+include = ["src"]
+exclude = [".venv", "__pycache__"]
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["nonebot_plugin_lottery"]
+module-root = "src/plugins"
