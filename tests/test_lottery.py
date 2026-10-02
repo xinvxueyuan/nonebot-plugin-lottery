@@ -1,17 +1,21 @@
 """抽奖（禁言小助手）测试。
 
-重点覆盖用户 2026-10-02 追加的那条要求：
-**「原样但超 10 分钟的定时自动解禁（隐性）」** —— 它有三个可独立测的断言：
-  ① 回复里报的是**抽到的原始数字**（隐性：不透露封顶）；
-  ② 实际 `set_group_ban(duration=)` 封顶到 10 分钟；
-  ③ 抽中超时值时，**才**挂定时解禁任务。
+重点覆盖用户 2026-10-02 追加的那条要求：**「超阈值的定时自动解禁」**。
 
-② 与 ③ 是**两层**保障，必须都测到：只靠定时任务的话，qbot 重启（这台机器 3 天
-重启过 12 次）任务就丢了，被抽到 480 分钟的人会被真关 8 小时。
+用户后来明确纠正过语义（很重要，别写反）：
+    ✅ 禁言按**抽到的时长**下（480 就真禁 480），到 10 分钟时**调 API 解禁**
+    ❌ 不是「把禁言时长砍成 10 分钟」（那是把平台参数当成上限用，已被否决）
+
+所以核心断言是：
+  ① `set_group_ban(duration=)` == 抽到的分钟数 * 60（**不封顶**）；
+  ② 抽到的值 > 阈值时，挂一个「+阈值 分钟」的解禁任务（任务体调 duration=0）；
+  ③ 抽到的值 ≤ 阈值时不挂任务（等平台自然到期）。
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+import time
 from types import SimpleNamespace
 
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
@@ -20,53 +24,42 @@ import pytest
 from nonebot_plugin_lottery import pick_mute_minutes, plugin_config
 from nonebot_plugin_lottery.config import Config
 
-# ── 纯函数：随机 + 封顶 ────────────────────────────────────────────
+# ── 纯函数：抽时长（不封顶）────────────────────────────────────────
 
 
 def test_rolled_value_inside_range():
     for _ in range(200):
-        rolled, _actual = pick_mute_minutes(1, 480, 10)
-        assert 1 <= rolled <= 480
+        assert 1 <= pick_mute_minutes(1, 480) <= 480
 
 
-def test_actual_is_capped_but_rolled_is_not():
-    """**核心**：报出来的不封顶、实际禁言封顶。这就是「隐性」。"""
+def test_rolled_value_is_returned_as_is_without_capping():
+    """**核心**：抽到多少就是多少 —— 禁言时长不做任何封顶。
+
+    这条钉住用户纠正过的语义。若有人「好心」把 min(rolled, cap) 加回来，这里会红。
+    """
     for _ in range(200):
-        rolled, actual = pick_mute_minutes(1, 480, 10)
-        assert actual == min(rolled, 10)
-        assert actual <= 10
+        rolled = pick_mute_minutes(1, 480)
+        assert rolled >= 1  # 返回值本身就是完整时长，没有被截断
+    assert pick_mute_minutes(1, 480, rng=lambda _a, _b: 480) == 480
+    assert pick_mute_minutes(1, 480, rng=lambda _a, _b: 479) == 479
 
 
-def test_values_within_cap_are_untouched():
-    """抽到的数没超上限时，实际时长与抽到的一致（不改原有手感）。"""
+def test_values_within_range_are_untouched():
     for _ in range(200):
-        rolled, actual = pick_mute_minutes(1, 10, 10)
-        assert actual == rolled
-
-
-def test_cap_larger_than_max_has_no_effect():
-    """上限比 MAX 还大 = 封顶不生效（配置成 999 分钟时的预期行为）。"""
-    for _ in range(100):
-        rolled, actual = pick_mute_minutes(1, 60, 999)
-        assert actual == rolled
+        rolled = pick_mute_minutes(1, 10)
+        assert 1 <= rolled <= 10
 
 
 def test_deterministic_rng_is_used():
     """注入 rng 后结果可预测 —— 便于断言边界（而不是靠随机碰运气）。"""
-    rolled, actual = pick_mute_minutes(1, 480, 10, rng=lambda _a, _b: 480)
-    assert (rolled, actual) == (480, 10)
-
-    rolled, actual = pick_mute_minutes(1, 480, 10, rng=lambda _a, _b: 1)
-    assert (rolled, actual) == (1, 1)
-
-    # 正好等于上限：不算超时，不该挂定时任务（边界，差一就错）
-    rolled, actual = pick_mute_minutes(1, 480, 10, rng=lambda _a, _b: 10)
-    assert (rolled, actual) == (10, 10)
+    assert pick_mute_minutes(1, 480, rng=lambda _a, _b: 480) == 480
+    assert pick_mute_minutes(1, 480, rng=lambda _a, _b: 1) == 1
+    # 正好等于阈值：不算超时，不该挂定时任务（边界，差一就错）
+    assert pick_mute_minutes(1, 480, rng=lambda _a, _b: 10) == 10
 
 
 def test_min_equal_max():
-    rolled, actual = pick_mute_minutes(5, 5, 10)
-    assert (rolled, actual) == (5, 5)
+    assert pick_mute_minutes(5, 5) == 5
 
 
 def test_rng_is_called_with_the_configured_bounds():
@@ -76,7 +69,7 @@ def test_rng_is_called_with_the_configured_bounds():
         seen.append((a, b))
         return a
 
-    pick_mute_minutes(3, 77, 10, rng=spy)
+    pick_mute_minutes(3, 77, rng=spy)
     assert seen == [(3, 77)]
 
 
@@ -84,11 +77,11 @@ def test_rng_is_called_with_the_configured_bounds():
 
 
 def test_default_config_matches_upstream_plugin():
-    """默认值必须与真寻原插件一致（MIN=1 / MAX=480）。"""
+    """默认值必须与真寻原插件一致（MIN=1 / MAX=480），解禁阈值 10。"""
     cfg = Config()
     assert cfg.lottery_min_mute_time == 1
     assert cfg.lottery_max_mute_time == 480
-    assert cfg.lottery_mute_cap_minutes == 10
+    assert cfg.lottery_unmute_after_minutes == 10
 
 
 def test_inverted_range_is_swapped_not_raised():
@@ -98,9 +91,14 @@ def test_inverted_range_is_swapped_not_raised():
     assert cfg.lottery_max_mute_time == 480
 
 
-def test_cap_must_be_positive():
+def test_unmute_threshold_must_be_positive():
     with pytest.raises(ValueError):
-        Config(lottery_mute_cap_minutes=0)
+        Config(lottery_unmute_after_minutes=0)
+
+
+def test_old_cap_name_is_gone():
+    """旧的 `lottery_mute_cap_minutes`（禁言封顶）不该再存在 —— 语义已否决。"""
+    assert not hasattr(Config(), "lottery_mute_cap_minutes")
 
 
 # ── 插件确实加载了（import 期没有静默降级）─────────────────────────
@@ -118,9 +116,9 @@ def test_plugin_metadata_names_the_upstream_author():
 def _registered_commands(matcher) -> set[str]:
     """从 matcher 的 rule 里取出注册的命令字串。
 
-    NoneBot2 把命令放在 `matcher.rule.checkers` 里的 `Dependent.call`（`Command`）上，
-    `cmds` 是**元组嵌套**（`(("抽奖",),)`，内层是 aliases）—— 直接 `in rule.commands`
-    会 AttributeError（这个我第一版就写错了）。
+    命令在 `matcher.rule.checkers` 里的 `Dependent.call`（`Command`）上，
+    `cmds` 是**元组嵌套**（`(("抽奖",),)`，内层是 aliases）——
+    直接 `in matcher.rule.commands` 会 AttributeError（这个我第一版就写错了）。
     """
     out: set[str] = set()
     for checker in matcher.rule.checkers or ():
@@ -141,7 +139,7 @@ def test_command_is_registered():
     assert lottery_cmd.block is True
 
 
-# ── handler：三态行为（报原始值 / 封顶 / 挂任务）────────────────────
+# ── handler：禁言时长 / 解禁任务 ──────────────────────────────────
 
 
 def _group_event() -> GroupMessageEvent:
@@ -184,6 +182,27 @@ class _FakeBot:
 
 
 @pytest.fixture
+def captured_reply(monkeypatch):
+    """只拦 `finish()`（拿回复文案），**不拦** `_schedule_unmute`。
+
+    落库/挂任务相关用例必须用它 —— 用 `captured` 会把 `_schedule_unmute`
+    整个替换掉，于是「有没有落库」永远测不到（测试自欺）。
+    """
+    from nonebot.exception import FinishedException
+
+    from nonebot_plugin_lottery import lottery_cmd
+
+    state = SimpleNamespace(messages=[])
+
+    async def fake_finish(message=None, **kwargs):
+        state.messages.append(str(message) if message is not None else "")
+        raise FinishedException
+
+    monkeypatch.setattr(lottery_cmd, "finish", fake_finish)
+    return state
+
+
+@pytest.fixture
 def captured(monkeypatch):
     """拦 `lottery_cmd.finish()`，把回复文案与挂载的定时任务都记下来。
 
@@ -202,13 +221,11 @@ def captured(monkeypatch):
 
     monkeypatch.setattr(lottery_cmd, "finish", fake_finish)
 
-    from nonebot_plugin_lottery import _schedule_unmute
-
-    def fake_schedule(bot, group_id, user_id, minutes):
-        state.jobs.append((group_id, user_id, minutes))
+    def fake_schedule(bot, group_id, user_id, minutes, *, ban_minutes):
+        # ban_minutes 是本次禁言的完整时长（用于算「自然到期」），一并记下来
+        state.jobs.append((group_id, user_id, minutes, ban_minutes))
 
     monkeypatch.setattr("nonebot_plugin_lottery._schedule_unmute", fake_schedule)
-    del _schedule_unmute
     return state
 
 
@@ -216,22 +233,23 @@ async def _run(bot: _FakeBot, event: GroupMessageEvent) -> None:
     """直接调 handler 函数体（跳过 matcher 派发）。"""
     import nonebot_plugin_lottery as plugin
 
-    handler = plugin._handle_lottery
     with pytest.raises(Exception):  # noqa: B017 - finish() 抛 FinishedException
-        await handler(bot, event)
+        await plugin._handle_lottery(bot, event)
 
 
-async def test_handler_bans_with_capped_duration_and_reports_rolled(
-    captured, monkeypatch
-):
-    """**核心用例**：报 480 分钟，实际只禁言 10 分钟，并且挂了定时解禁。
+def _ban_duration(bot: _FakeBot) -> int:
+    return next(c for c in bot.calls if c[0] == "set_group_ban")[1]["duration"]
 
-    把封顶只做在定时任务上（不改 duration）时，这条会红 —— 那正是
-    「bot 一重启就变成真关 8 小时」的写法。
+
+async def test_ban_duration_is_the_rolled_value_not_capped(captured, monkeypatch):
+    """**核心用例**：抽到 480 分钟 → `duration=480*60`（真禁 480 分钟）。
+
+    同时应挂一个 10 分钟后的解禁任务。
+
+    这条钉住用户纠正过的语义：
+    「不是调用平台 API 禁言 10 分钟，是到时间再调用 API 解禁」。
+    若有人把 duration 改成 `min(rolled, 10) * 60`，这里会红。
     """
-    monkeypatch.setattr(
-        "nonebot_plugin_lottery.randint", lambda _a, _b: 480, raising=False
-    )
     import nonebot_plugin_lottery as plugin
 
     monkeypatch.setattr(plugin, "randint", lambda _a, _b: 480)
@@ -239,16 +257,45 @@ async def test_handler_bans_with_capped_duration_and_reports_rolled(
     bot = _FakeBot()
     await _run(bot, _group_event())
 
-    ban = next((c for c in bot.calls if c[0] == "set_group_ban"), None)
-    assert ban is not None, "没有调用 set_group_ban"
-    assert ban[1]["duration"] == 600, "实际禁言没封顶到 10 分钟"
+    assert _ban_duration(bot) == 480 * 60, "禁言时长被改成了抽到的原始值以外的东西"
+    assert "480分钟禁言大礼包" in captured.messages[-1], "回复里应报抽到的原始值"
+    assert captured.jobs == [(1094538078, 10001, 10, 480)], (
+        "超阈值应挂 10 分钟后的解禁任务"
+    )
 
-    assert "480分钟禁言大礼包" in captured.messages[-1], "回复里报的应是抽到的原始值"
-    assert captured.jobs == [(1094538078, 10001, 10)], "超时值没有挂定时解禁"
+
+async def test_ban_duration_equals_rolled_for_every_value(captured, monkeypatch):
+    """遍历各种抽到的值：duration 恒等于 rolled*60（不许出现任何封顶/截断）。"""
+    import nonebot_plugin_lottery as plugin
+
+    for rolled in (1, 9, 10, 11, 60, 479, 480):
+        monkeypatch.setattr(plugin, "randint", lambda _a, _b, r=rolled: r)
+        bot = _FakeBot()
+        await _run(bot, _group_event())
+        assert _ban_duration(bot) == rolled * 60, (
+            f"抽到 {rolled} 分钟时禁言时长变成 {_ban_duration(bot)}s"
+        )
 
 
-async def test_handler_skips_unmute_job_when_within_cap(captured, monkeypatch):
-    """抽到 3 分钟：不挂定时任务（平台自己到期就解了）。"""
+async def test_unmute_job_delay_is_the_threshold_not_the_rolled_value(
+    captured, monkeypatch
+):
+    """解禁任务的**延迟**必须是阈值（10），不是抽到的值（480）。
+
+    写反的话：解禁会在 480 分钟后触发 = 等于没解禁，而且看不出错。
+    """
+    import nonebot_plugin_lottery as plugin
+
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 479)
+
+    bot = _FakeBot()
+    await _run(bot, _group_event())
+
+    assert captured.jobs == [(1094538078, 10001, 10, 479)]
+
+
+async def test_no_unmute_job_when_within_threshold(captured, monkeypatch):
+    """抽到 3 分钟（没超阈值）：不挂任务，等平台自然到期。"""
     import nonebot_plugin_lottery as plugin
 
     monkeypatch.setattr(plugin, "randint", lambda _a, _b: 3)
@@ -256,23 +303,35 @@ async def test_handler_skips_unmute_job_when_within_cap(captured, monkeypatch):
     bot = _FakeBot()
     await _run(bot, _group_event())
 
-    assert next(c for c in bot.calls if c[0] == "set_group_ban")[1]["duration"] == 180
+    assert _ban_duration(bot) == 180
     assert captured.jobs == []
     assert "3分钟禁言大礼包" in captured.messages[-1]
 
 
-async def test_handler_never_exceeds_the_cap_even_when_rolled_max(
-    captured, monkeypatch
-):
-    """遍历抽到的各种值，实际 duration 永不超过封顶（防差一错误）。"""
+async def test_rolled_exactly_at_threshold_schedules_no_job(captured, monkeypatch):
+    """抽到 10 = 阈值本身：不算超时，不该挂任务（`>` 写成 `>=` 就会多挂）。"""
     import nonebot_plugin_lottery as plugin
 
-    for rolled in (1, 9, 10, 11, 60, 479, 480):
-        monkeypatch.setattr(plugin, "randint", lambda _a, _b, r=rolled: r)
-        bot = _FakeBot()
-        await _run(bot, _group_event())
-        duration = next(c for c in bot.calls if c[0] == "set_group_ban")[1]["duration"]
-        assert duration <= 600, f"抽到 {rolled} 分钟时实际禁言 {duration}s 超了封顶"
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 10)
+
+    bot = _FakeBot()
+    await _run(bot, _group_event())
+
+    assert _ban_duration(bot) == 600
+    assert captured.jobs == []
+
+
+async def test_rolled_one_above_threshold_schedules_job(captured, monkeypatch):
+    """抽到 11 = 阈值 +1：要挂任务（与上一条配对，钉死边界的方向）。"""
+    import nonebot_plugin_lottery as plugin
+
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 11)
+
+    bot = _FakeBot()
+    await _run(bot, _group_event())
+
+    assert _ban_duration(bot) == 660
+    assert captured.jobs == [(1094538078, 10001, 10, 11)]
 
 
 async def test_ban_failure_reports_permission_hint_and_no_job(captured, monkeypatch):
@@ -321,7 +380,7 @@ async def test_reply_comes_after_the_ban(captured, monkeypatch):
 # ── 定时解禁任务体 ────────────────────────────────────────────────
 
 
-async def test_unmute_job_calls_set_group_ban_zero(monkeypatch):
+async def test_unmute_job_calls_set_group_ban_zero(monkeypatch, tmp_store):
     """任务体必须用 `duration=0` 解禁（OneBot 的解禁约定）。"""
     import nonebot_plugin_lottery as plugin
 
@@ -335,7 +394,7 @@ async def test_unmute_job_calls_set_group_ban_zero(monkeypatch):
     ]
 
 
-async def test_unmute_job_tolerates_bot_unavailable(monkeypatch):
+async def test_unmute_job_tolerates_bot_unavailable(monkeypatch, tmp_store):
     """Bot 离线/重启后取不到实例：静默放弃，**不能抛**（会污染 apscheduler 日志）。"""
     import nonebot_plugin_lottery as plugin
 
@@ -347,7 +406,7 @@ async def test_unmute_job_tolerates_bot_unavailable(monkeypatch):
     await plugin._unmute("3128682634", 1094538078, 10001)  # 不抛即通过
 
 
-async def test_unmute_job_tolerates_api_failure(monkeypatch):
+async def test_unmute_job_tolerates_api_failure(monkeypatch, tmp_store):
     """解禁 API 失败也不能抛（有人的禁言可能已被其他插件解开）。"""
     import nonebot_plugin_lottery as plugin
 
@@ -361,11 +420,11 @@ async def test_unmute_job_tolerates_api_failure(monkeypatch):
 # ── 接住「写了函数没人调」的接线断言 ──────────────────────────────
 
 
-def test_schedule_unmute_actually_registers_an_apscheduler_job(monkeypatch):
-    """`_schedule_unmute` 要真的把任务交给 apscheduler（而不是只 log 一句）。
+def test_add_unmute_job_actually_registers_an_apscheduler_job(monkeypatch):
+    """`_add_unmute_job` 要真的把任务交给 apscheduler（而不是只 log 一句）。
 
-    上面那些 handler 用例都把这个函数替换掉了（为了稳定），
-    所以必须有这条来钉住「它自己真的会挂任务」——否则整体可能是个空壳。
+    ⚠️ handler 相关的用例大多把这个函数或 `_schedule_unmute` 替换掉了（为了稳定），
+    所以必须有这条钉住「它自己真的会挂任务」—— 否则整套可能是个空壳。
     """
     import nonebot_plugin_lottery as plugin
 
@@ -377,25 +436,55 @@ def test_schedule_unmute_actually_registers_an_apscheduler_job(monkeypatch):
 
     monkeypatch.setattr(plugin, "scheduler", _FakeScheduler())
 
-    bot = _FakeBot()
-    plugin._schedule_unmute(bot, 1094538078, 10001, 10)
+    when = datetime.now() + timedelta(minutes=10)
+    plugin._add_unmute_job("3128682634", 1094538078, 10001, when=when)
 
     assert len(added) == 1
     job = added[0]
     assert job["func"] is plugin._unmute
     assert job["trigger"] == "date"
+    assert job["run_date"] == when, (
+        "run_date 必须用传进来的绝对时刻（重启重建才对得上）"
+    )
     assert job["args"] == ["3128682634", 1094538078, 10001]
     assert job["id"] == "lottery_unmute_1094538078_10001"
     assert job["replace_existing"] is True
-    # run_date 应在 ~10 分钟后（同一用户二次抽奖要覆盖旧任务，不能叠加）
-    from datetime import datetime
-
-    delta = (job["run_date"] - datetime.now()).total_seconds()
-    assert 570 <= delta <= 600, f"解禁时间不对：{delta}s"
+    assert job["misfire_grace_time"] == plugin._MISFIRE_GRACE_SECONDS
 
 
-def test_schedule_unmute_swallows_scheduler_failure(monkeypatch):
-    """挂任务失败只 warning，不影响已生效的封顶禁言。"""
+def test_schedule_unmute_writes_record_then_schedules(tmp_store, monkeypatch):
+    """`_schedule_unmute` = **先落库、再挂任务**，且 unmute_at/expire_at 都算对。
+
+    顺序很重要：先挂任务后落库的话，两步之间进程崩掉就只剩一个内存任务，
+    而它随进程一起没了 —— 记录也没留下，等于彻底丢失。
+    """
+    import nonebot_plugin_lottery as plugin
+    from nonebot_plugin_lottery import store
+
+    order: list[str] = []
+
+    real_save = store.save_pending
+
+    def spy_save(**kwargs):
+        order.append("save")
+        return real_save(**kwargs)
+
+    monkeypatch.setattr(store, "save_pending", spy_save)
+    monkeypatch.setattr(
+        plugin, "_add_unmute_job", lambda *a, **k: order.append("schedule")
+    )
+
+    before = time.time()
+    plugin._schedule_unmute(_FakeBot(), 1094538078, 10001, 10, ban_minutes=480)
+
+    assert order == ["save", "schedule"], f"顺序错了：{order}"
+    row = store.all_pending()[0]
+    assert 590 <= row["unmute_at"] - before <= 610
+    assert 480 * 60 - 10 <= row["expire_at"] - before <= 480 * 60 + 10
+
+
+def test_add_unmute_job_swallows_scheduler_failure(monkeypatch):
+    """挂任务失败只 warning —— 记录已在库里，下次启动会重建。"""
     import nonebot_plugin_lottery as plugin
 
     class _BrokenScheduler:
@@ -404,7 +493,9 @@ def test_schedule_unmute_swallows_scheduler_failure(monkeypatch):
 
     monkeypatch.setattr(plugin, "scheduler", _BrokenScheduler())
 
-    plugin._schedule_unmute(_FakeBot(), 1094538078, 10001, 10)  # 不抛即通过
+    plugin._add_unmute_job(
+        "3128682634", 1094538078, 10001, when=datetime.now()
+    )  # 不抛即通过
 
 
 def test_config_is_actually_used_by_the_handler():
@@ -416,8 +507,8 @@ def test_config_is_actually_used_by_the_handler():
     src = inspect.getsource(plugin._handle_lottery)
     assert "plugin_config.lottery_min_mute_time" in src
     assert "plugin_config.lottery_max_mute_time" in src
-    assert "plugin_config.lottery_mute_cap_minutes" in src
-    assert plugin_config.lottery_mute_cap_minutes == 10
+    assert "plugin_config.lottery_unmute_after_minutes" in src
+    assert plugin_config.lottery_unmute_after_minutes == 10
 
 
 # ── NoneBot 依赖注入：注解必须**运行时可解析** ────────────────────
@@ -446,22 +537,200 @@ def test_handler_annotations_resolve_to_real_classes_at_runtime():
     assert anns["event"] is GroupMessageEvent
 
 
-# ── 边界：抽到的数**正好等于**上限 ────────────────────────────────
+# ── 容灾：抽奖命中时必须**落库**（不只是挂内存任务）─────────────────
 
 
-async def test_rolled_exactly_at_cap_schedules_no_job(captured, monkeypatch):
-    """抽到 10 = 上限本身：不算超时，不该挂任务（`>` 写成 `>=` 就会多挂）。
+async def test_lottery_persists_pending_unmute(captured_reply, monkeypatch, tmp_path):
+    """抽到超阈值时：写一条待解禁记录，且 `unmute_at`/`expire_at` 都要对。
 
-    多挂一个任务本身无害，但它说明判据写错了 —— 而同一个判据将来一旦被
-    复用（比如改成「超时就不禁言」），差一错误就会变成功能错误。
+    只挂内存任务不落库 = 重启即丢，容灾要求不满足（用户明确要求持久化）。
     """
+    from nonebot_plugin_lottery import store
+
+    store.init(tmp_path / "lottery.sqlite3")
     import nonebot_plugin_lottery as plugin
 
-    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 10)
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 480)
 
+    before = time.time()
     bot = _FakeBot()
     await _run(bot, _group_event())
 
-    assert next(c for c in bot.calls if c[0] == "set_group_ban")[1]["duration"] == 600
-    assert captured.jobs == []
-    assert "10分钟禁言大礼包" in captured.messages[-1]
+    rows = store.all_pending()
+    assert len(rows) == 1, "抽奖命中后没有落库 → 重启就丢"
+    row = rows[0]
+    assert (row["bot_id"], row["group_id"], row["user_id"]) == (
+        "3128682634",
+        1094538078,
+        10001,
+    )
+    # unmute_at ≈ 现在 + 10 分钟；expire_at ≈ 现在 + 480 分钟
+    assert 590 <= row["unmute_at"] - before <= 610
+    assert 480 * 60 - 10 <= row["expire_at"] - before <= 480 * 60 + 10
+
+
+async def test_lottery_does_not_persist_when_within_threshold(
+    captured, monkeypatch, tmp_path
+):
+    """没超阈值：不落库、不挂任务（平台自然到期即可，别留垃圾记录）。"""
+    from nonebot_plugin_lottery import store
+
+    store.init(tmp_path / "lottery.sqlite3")
+    import nonebot_plugin_lottery as plugin
+
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 3)
+
+    await _run(_FakeBot(), _group_event())
+
+    assert store.count() == 0
+
+
+async def test_lottery_does_not_persist_when_ban_failed(
+    captured, monkeypatch, tmp_path
+):
+    """禁言失败（不是管理员）：**不能**留待解禁记录。
+
+    否则启动时会去解一个根本没下过的禁言。
+    """
+    from nonebot_plugin_lottery import store
+
+    store.init(tmp_path / "lottery.sqlite3")
+    import nonebot_plugin_lottery as plugin
+
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 480)
+
+    bot = _FakeBot()
+    bot.ban_error = RuntimeError("不是管理员")
+    await _run(bot, _group_event())
+
+    assert store.count() == 0
+
+
+# ── 容灾：解禁成功/失败时记录的去留 ───────────────────────────────
+
+
+async def test_unmute_success_deletes_record(monkeypatch, tmp_path):
+    from nonebot_plugin_lottery import store
+
+    store.init(tmp_path / "lottery.sqlite3")
+    now = time.time()
+    store.save_pending(
+        bot_id="3128682634",
+        group_id=1094538078,
+        user_id=10001,
+        unmute_at=now,
+        expire_at=now + 3600,
+    )
+
+    import nonebot_plugin_lottery as plugin
+
+    bot = _FakeBot()
+    monkeypatch.setattr(plugin, "get_bot", lambda _bid: bot, raising=False)
+
+    await plugin._unmute("3128682634", 1094538078, 10001)
+
+    assert store.count() == 0, "解禁成功应清掉记录，否则表会无限增长"
+
+
+async def test_unmute_failure_keeps_record_and_reschedules(monkeypatch, tmp_path):
+    """**容灾核心**：解禁失败时记录必须留着，并重排一次重试。
+
+    上一版「失败就 return」会留下一条永远没人再碰的记录：表里看着有任务，
+    实际再也不会解禁 —— 比丢任务更隐蔽。
+    """
+    from nonebot_plugin_lottery import store
+
+    store.init(tmp_path / "lottery.sqlite3")
+    now = time.time()
+    store.save_pending(
+        bot_id="3128682634",
+        group_id=1094538078,
+        user_id=10001,
+        unmute_at=now,
+        expire_at=now + 3600,
+    )
+
+    import nonebot_plugin_lottery as plugin
+
+    rescheduled: list[dict] = []
+
+    def fake_add(bot_id, group_id, user_id, *, when):
+        rescheduled.append({"when": when})
+
+    monkeypatch.setattr(plugin, "_add_unmute_job", fake_add)
+
+    bot = _FakeBot()
+    bot.ban_error = RuntimeError("API 抖动")
+    monkeypatch.setattr(plugin, "get_bot", lambda _bid: bot, raising=False)
+
+    await plugin._unmute("3128682634", 1094538078, 10001)
+
+    assert store.count() == 1, "失败时记录不能删（否则再也不会重试）"
+    assert store.all_pending()[0]["attempts"] == 1
+    assert len(rescheduled) == 1, "失败后应重排一次重试"
+    delta = (rescheduled[0]["when"] - datetime.now()).total_seconds()
+    assert 50 <= delta <= 70, f"重试间隔应约 60 秒，实际 {delta}s"
+
+
+async def test_unmute_bot_unavailable_keeps_record_and_reschedules(
+    monkeypatch, tmp_path
+):
+    """Bot 取不到（离线中）同样是「这一刻放不出去」，不能删记录。"""
+    from nonebot_plugin_lottery import store
+
+    store.init(tmp_path / "lottery.sqlite3")
+    now = time.time()
+    store.save_pending(
+        bot_id="3128682634",
+        group_id=1094538078,
+        user_id=10001,
+        unmute_at=now,
+        expire_at=now + 3600,
+    )
+
+    import nonebot_plugin_lottery as plugin
+
+    def boom(_bid):
+        raise RuntimeError("bot offline")
+
+    monkeypatch.setattr(plugin, "get_bot", boom, raising=False)
+    monkeypatch.setattr(plugin, "_add_unmute_job", lambda *a, **k: None)
+
+    await plugin._unmute("3128682634", 1094538078, 10001)  # 不抛即通过
+
+    assert store.count() == 1
+
+
+async def test_unmute_gives_up_after_max_attempts(monkeypatch, tmp_path):
+    """重试到上限就放弃并删记录（否则 bot 长期离线会无限重试刷日志）。"""
+    from nonebot_plugin_lottery import store
+
+    store.init(tmp_path / "lottery.sqlite3")
+    now = time.time()
+    store.save_pending(
+        bot_id="3128682634",
+        group_id=1094538078,
+        user_id=10001,
+        unmute_at=now,
+        expire_at=now + 3600,
+    )
+
+    import nonebot_plugin_lottery as plugin
+
+    for _ in range(plugin._MAX_UNMUTE_ATTEMPTS):
+        store.bump_attempts(1094538078, 10001)
+
+    rescheduled: list[dict] = []
+    monkeypatch.setattr(
+        plugin, "_add_unmute_job", lambda *a, **k: rescheduled.append(k)
+    )
+
+    def boom(_bid):
+        raise RuntimeError("bot offline")
+
+    monkeypatch.setattr(plugin, "get_bot", boom, raising=False)
+
+    await plugin._unmute("3128682634", 1094538078, 10001)
+
+    assert store.count() == 0, "超过重试上限应清掉记录"
+    assert rescheduled == [], "放弃时不该再排重试"

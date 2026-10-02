@@ -32,33 +32,70 @@
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LOTTERY_MIN_MUTE_TIME` | `1` | 抽奖禁言最短时间（分钟） |
-| `LOTTERY_MAX_MUTE_TIME` | `480` | 抽奖禁言最长时间（分钟）；**回复里报的就是抽到的这个数** |
-| `LOTTERY_MUTE_CAP_MINUTES` | `10` | **实际**禁言上限（分钟） |
+| `LOTTERY_MAX_MUTE_TIME` | `480` | 抽奖禁言最长时间（分钟）；报多少就**真禁**多久 |
+| `LOTTERY_UNMUTE_AFTER_MINUTES` | `10` | 禁言超过这个分钟数时，到点由机器人**调 API 解禁** |
+| `LOTTERY_PERSIST_PENDING` | `true` | 解禁任务的**容灾持久化**（落 sqlite + 启动重建） |
 
 `MIN > MAX` 写反了会自动对调并打 warning，不会让插件起不来。
 
-## 「超时自动解禁」是怎么做的（两层，缺一不可）
+## 「超 N 分钟自动解禁」是怎么做的
 
-用户要求的是「**原样但超 10 分钟的定时自动解禁（隐性）**」，落地成两层：
+要求是「**原样但超 10 分钟的定时自动解禁（隐性）**」，语义是
+**到时间再调用 API 解禁**，而**不是**把禁言时长砍成 10 分钟：
 
-1. **实际禁言时长 = `min(抽到的数, LOTTERY_MUTE_CAP_MINUTES)`**
-   —— 让平台侧到点自己解开，**不依赖本进程活着**。
-2. 抽到超时值时，**额外**挂一个 apscheduler 一次性任务在
-   `+上限` 分钟时 `set_group_ban(duration=0)` 精确解禁（幂等）。
+1. **禁言时长 = 抽到的原始值**（抽到 480 就真禁 480 分钟）——`duration=rolled*60`，不封顶。
+2. 抽到的值 > 阈值（10）时，用 **nonebot-plugin-apscheduler** 挂一个一次性任务，
+   在 **+10 分钟**时调 `set_group_ban(duration=0)` 把人主动放出来
+   （幂等；同一用户二次抽奖覆盖旧任务）。
 
-为什么不能只靠第 2 层：apscheduler 的任务是**进程内内存态**，bot 一重启就丢了。
-生产机（qbot）3 天里重启过 12 次，只靠定时任务的话，被抽到 480 分钟的人
-会被**真关 8 小时**。把封顶做进 `duration` 后，无论 bot 死没死，
-用户最多被关 10 分钟；定时任务退化成「更精确的兜底」。
+抽到的值 ≤ 阈值时不挂任务，等平台自然到期即可。
 
-**「隐性」= 回复里报的仍是抽到的原始数字**（保留原插件的玩笑效果），
-不告诉群里「其实只关了 10 分钟」。
+**「隐性」= 回复里报的数字与真实禁言时长一致**，但群里不会被告知
+「其实 10 分钟后会被机器人提前放出来」。
+
+## 容灾持久化（为什么还要一张 sqlite 表）
+
+apscheduler 的任务默认只在**进程内存**里（`MemoryJobStore`）：bot 一重启，
+等着解禁的任务就全没了 —— 被抽到 480 分钟的人会被真关 8 小时，而日志里
+什么都看不出来。生产 qbot 3 天里重启过 12 次，不是小概率。
+
+所以真相落在 sqlite（`lottery_pending_unmute` 表），apscheduler 只负责调度：
+
+```
+抽奖命中        → 先落库（unmute_at 绝对时刻 + expire_at 自然到期时刻），再挂任务
+进程启动        → 读表重建：未到期的按原时刻重挂；已错过但未自然到期的**立刻**解禁；
+                  连 expire_at 都过了的（平台早解开）直接清记录，不调无用 API
+解禁成功        → 删记录
+解禁失败/离线    → 记录留下 + attempts+1，60 秒后重试；超过 20 次才放弃并删记录
+同一人二次抽奖   → 覆盖旧记录（唯一键 group_id+user_id），attempts 归零
+```
+
+### 为什么不用 apscheduler 自带的持久化 jobstore
+
+`SQLAlchemyJobStore` 靠 pickle 保存**函数引用串**，恢复时 `__import__(模块名)`。
+宿主 qbot 用 `nonebot.load_from_toml()` 加载 `vendor/` 下的插件，模块名是
+从路径推导的**合成名**，带连字符：
+
+```
+vendor.nonebot-plugin-lottery.src.plugins.nonebot_plugin_lottery
+```
+
+连字符不是合法标识符 → `__import__` 必然失败。实测（2026-10-02）：
+
+```
+ref_to_obj("vendor.nonebot-plugin-lottery.src.plugins.nonebot_plugin_lottery:_unmute")
+-> LookupError: Error resolving reference ...: could not import module
+```
+
+也就是说**即使 jobstore 写成功了，重启后也一定恢复不回来** —— 那种「持久化」
+只会给人一种已经安全了的错觉。故采用「自建表 + 启动重建」，零新依赖、行为可测。
 
 ## 依赖
 
 - `nonebot2 >= 2.5`
 - `nonebot-adapter-onebot >= 2.4.6`
-- `nonebot-plugin-apscheduler >= 0.5`（第 2 层定时解禁用）
+- `nonebot-plugin-apscheduler >= 0.5`（调度）
+- `nonebot-plugin-localstore >= 0.7.4`（容灾库放在插件数据目录）
 
 ## 安装（宿主以 git 子模块引入）
 

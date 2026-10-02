@@ -16,11 +16,15 @@ class Config(BaseModel):
     环境变量 ``LOTTERY_MIN_MUTE_TIME``：抽奖禁言最短时间（分钟），默认 1。
 
     环境变量 ``LOTTERY_MAX_MUTE_TIME``：抽奖禁言最长时间（分钟），默认 480。
-    抽奖时在 ``[MIN, MAX]`` 之间等概率取一个数，**回复里报的就是这个数**。
+    抽奖时在 ``[MIN, MAX]`` 之间等概率取一个数，**禁言时长就是它**。
 
-    环境变量 ``LOTTERY_MUTE_CAP_MINUTES``：实际禁言上限（分钟），默认 10。
-    超过它的抽取结果**实际只禁言这么久**，并额外挂一个定时解禁任务兜底
-    （用户 2026-10-02 要求：「原样但超 10 分钟的定时自动解禁（隐性）」）。
+    环境变量 ``LOTTERY_UNMUTE_AFTER_MINUTES``：超过这个分钟数时，机器人会在
+    到点后**主动调用 API 解禁**（默认 10 分钟）。
+
+    ⚠️ 注意这**不是**「禁言封顶」：禁言本身按抽到的时长下（480 就是真禁 480），
+    只是到 ``UNMUTE_AFTER`` 分钟时再调一次 ``set_group_ban(duration=0)`` 把人放出来。
+    用户 2026-10-02 明确纠正：
+    「**不是调用平台 API 禁言 10 分钟，是到时间再调用 API 解禁**」。
     """
 
     lottery_min_mute_time: int = Field(
@@ -33,13 +37,17 @@ class Config(BaseModel):
         default=480,
         ge=1,
         le=43200,
-        description="抽奖禁言最长时间（分钟）；回复里报的就是抽到的数",
+        description="抽奖禁言最长时间（分钟）；报出来多少就真禁多久",
     )
-    lottery_mute_cap_minutes: int = Field(
+    lottery_unmute_after_minutes: int = Field(
         default=10,
         ge=1,
         le=43200,
-        description="实际禁言上限（分钟）；超过的抽取结果实际只关这么久 + 定时解禁兜底",
+        description="禁言超过这个分钟数时，到点由机器人调 API 主动解禁（非禁言封顶）",
+    )
+    lottery_persist_pending: bool = Field(
+        default=True,
+        description="是否启用解禁任务的容灾持久化（落 sqlite + 启动时重建任务）",
     )
 
     @model_validator(mode="after")

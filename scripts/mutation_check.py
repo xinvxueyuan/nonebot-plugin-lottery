@@ -1,6 +1,13 @@
-"""变异检验：故意把「封顶/隐性/定时解禁」写坏，看测试是否变红。
+"""变异检验：故意把「禁言时长 / 定时解禁 / 容灾持久化」写坏，看测试是否变红。
 
 只跑 pytest 的退出码 —— 绿色说明测试**没**抓到变异，即那个断言是空壳。
+
+当前语义（用户 2026-10-02 纠正 + 追加）：
+  - 禁言按**抽到的时长**下；到阈值分钟时**调 API 解禁**（不是把时长砍成 10 分钟）
+  - 必须用 nonebot-plugin-apscheduler 实现，且**做容灾持久化**（重启不丢任务）
+
+其中 M9 / M11 / M12 / M13 / M14 / M15 是「持久化到底有没有真的生效」的探针：
+只有容灾做对了，它们才会被抓到。
 """
 
 from __future__ import annotations
@@ -10,43 +17,51 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent  # scripts/ 的上一级 = 仓库根
-SRC = ROOT / "src/plugins/nonebot_plugin_lottery/__init__.py"
-BAK = ROOT / "src/plugins/nonebot_plugin_lottery/__init__.py.bak-mutation"
+
+TARGETS = {
+    "__init__": ROOT / "src/plugins/nonebot_plugin_lottery/__init__.py",
+    "store": ROOT / "src/plugins/nonebot_plugin_lottery/store.py",
+}
 
 ENV_PREFIX = (
     "env -u UV_PYTHON -u UV_PROJECT_ENVIRONMENT -u SSL_CERT_FILE "
     "-u VIRTUAL_ENV -u PYTHONPATH"
 )
 
-# (编号, 说明, 原文, 变异后)
-MUTATIONS: list[tuple[str, str, str, str]] = [
+# (编号, 说明, 目标, 原文, 变异后)
+MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "M1",
-        "去掉实际禁言的封顶（只靠定时任务）→ 这正是「bot 一重启就真关 8 小时」的写法",
-        "            duration=actual * 60,",
+        "把禁言时长砍成阈值（用户明确否决过的「用平台参数封顶」写法）",
+        "__init__",
         "            duration=rolled * 60,",
+        "            duration=min(rolled, unmute_after) * 60,",
     ),
     (
         "M2",
-        "回复里报封顶后的值（破坏「隐性」，群里会发现只关了 10 分钟）",
-        '        f"🎉 获得了 {rolled}分钟禁言大礼包 🎉"',
-        '        f"🎉 获得了 {actual}分钟禁言大礼包 🎉"',
+        "解禁任务的延迟用了抽到的值（480 分钟后才解禁 = 等于没解禁）",
+        "__init__",
+        "            unmute_after,\n            ban_minutes=rolled,",
+        "            rolled,\n            ban_minutes=rolled,",
     ),
     (
         "M3",
         "定时解禁只写日志、不真的挂 apscheduler 任务（空壳实现）",
+        "__init__",
         "        scheduler.add_job(",
-        "        _noop = lambda: None\n        _dead = lambda: None\n        _dead(",
+        "        _dead = lambda *a, **k: None\n        _dead(",
     ),
     (
         "M4",
-        "超时判据 `>` 写成 `>=`（抽到正好 10 分钟也去挂任务）",
-        "    if rolled > actual:",
-        "    if rolled >= actual:",
+        "超阈判据 `>` 写成 `>=`（抽到正好 10 分钟也去挂任务）",
+        "__init__",
+        "    if rolled > unmute_after:",
+        "    if rolled >= unmute_after:",
     ),
     (
         "M5",
-        "定时解禁用了封顶时长而不是 0（等于没解禁）",
+        "定时解禁用了禁言时长而不是 0（等于没解禁）",
+        "__init__",
         "        await bot.set_group_ban(group_id=group_id, user_id=user_id, duration=0)",
         "        await bot.set_group_ban(\n"
         "            group_id=group_id, user_id=user_id, duration=600\n"
@@ -55,14 +70,91 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     (
         "M6",
         "把 Bot/GroupMessageEvent 挪进 TYPE_CHECKING（依赖注入会静默失效）",
+        "__init__",
         "from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent",
-        "if TYPE_CHECKING:\n    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent",
+        "if TYPE_CHECKING:\n"
+        "    from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent",
     ),
     (
         "M7",
-        "`min(rolled, cap)` 写成 `max(rolled, cap)`（封顶变成下限）",
-        "    return rolled, min(rolled, cap)",
-        "    return rolled, max(rolled, cap)",
+        "`>` 判据反过来（没超阈值的才挂任务）",
+        "__init__",
+        "    if rolled > unmute_after:",
+        "    if rolled < unmute_after:",
+    ),
+    (
+        "M8",
+        "纯函数里把抽到的值截断（禁言时长不再等于抽到的值）",
+        "__init__",
+        "    return pick(minimum, maximum)",
+        "    return min(pick(minimum, maximum), 10)",
+    ),
+    (
+        "M9",
+        "抽奖命中时**不落库**（只挂内存任务）→ 重启就丢，容灾是假象",
+        "__init__",
+        "    store.save_pending(",
+        "    _skip_persist = lambda **kw: None\n    _skip_persist(",
+    ),
+    (
+        "M10",
+        "落库了但**不挂任务**（记录躺着，本进程内不会解禁）",
+        "__init__",
+        "    _add_unmute_job(str(bot.self_id), group_id, user_id, when=unmute_at)",
+        "    pass",
+    ),
+    (
+        "M11",
+        "解禁成功后**不删记录**（表无限增长，且下次启动会重复解禁）",
+        "__init__",
+        '    store.remove_pending(group_id, user_id)\n    logger.info("抽奖定时解禁完成',
+        '    logger.info("抽奖定时解禁完成',
+    ),
+    (
+        "M12",
+        "取不到 bot 就**直接放弃**（不重排重试、不累计 attempts）→ 记录永远没人再碰",
+        "__init__",
+        '        logger.warning("抽奖解禁：bot {} 暂时不可用，60 秒后重试", bot_id)\n'
+        "        _retry_later(bot_id, group_id, user_id)\n"
+        "        return",
+        '        logger.warning("抽奖解禁：bot {} 暂时不可用，60 秒后重试", bot_id)\n'
+        "        return",
+    ),
+    (
+        "M13",
+        "启动恢复时把**已自然到期**的记录也去调 API（无用调用 + 噪音）",
+        "__init__",
+        "        if expire_at <= now:",
+        "        if False:",
+    ),
+    (
+        "M14",
+        "启动恢复时把**已错过**的解禁丢掉（不补跑）→ 停机期间该解禁的人被漏掉",
+        "__init__",
+        "            when = datetime.now()  # 停机期间错过了，立刻补上\n"
+        "            overdue += 1",
+        "            store.remove_pending(group_id, user_id)\n            continue",
+    ),
+    (
+        "M15",
+        "**启动钩子不注册**（重建逻辑永远不跑）→ 容灾整体失效",
+        "__init__",
+        "if plugin_config.lottery_persist_pending:\n    get_driver().on_startup(_on_startup)",
+        "if False:\n    get_driver().on_startup(_on_startup)",
+    ),
+    (
+        "M16",
+        "恢复时按「现在+阈值」重排，而不是用记录里的**绝对时刻**（越重启越晚）",
+        "__init__",
+        "        when = datetime.fromtimestamp(unmute_at)",
+        "        when = datetime.now() + timedelta(minutes=10)",
+    ),
+    (
+        "M17",
+        "store 的 `(group_id,user_id)` 唯一约束失效 → 同一人叠出多条记录",
+        "store",
+        "    UNIQUE (group_id, user_id)",
+        "    UNIQUE (group_id, user_id, unmute_at)",
     ),
 ]
 
@@ -79,27 +171,27 @@ def run_pytest() -> int:
 
 
 def main() -> int:
-    original = SRC.read_text(encoding="utf-8")
-    BAK.write_text(original, encoding="utf-8")
+    originals = {key: path.read_text(encoding="utf-8") for key, path in TARGETS.items()}
 
     baseline = run_pytest()
     print(f"基线（未变异）: exit={baseline}  {'✅ 绿' if baseline == 0 else '❌ 红'}")
     if baseline != 0:
-        print("基线就不是绿的，变异检验无意义 —— 先修好")
+        print("基线不是绿的，变异检验无意义 —— 先修好")
         return 2
 
     rows: list[tuple[str, str, str]] = []
-    failures = 0
-    for mid, desc, old, new in MUTATIONS:
-        if old not in original:
+    missed = 0
+    for mid, desc, target, old, new in MUTATIONS:
+        source = originals[target]
+        if old not in source:
             rows.append((mid, desc, "⚠️ 锚点未命中（脚本要修）"))
-            failures += 1
+            missed += 1
             continue
         try:
-            SRC.write_text(original.replace(old, new, 1), encoding="utf-8")
+            TARGETS[target].write_text(source.replace(old, new, 1), encoding="utf-8")
             code = run_pytest()
         finally:
-            SRC.write_text(original, encoding="utf-8")
+            TARGETS[target].write_text(source, encoding="utf-8")
         caught = code != 0
         rows.append((
             mid,
@@ -107,7 +199,7 @@ def main() -> int:
             "✅ 变红（测试抓到了）" if caught else "❌ 仍绿（测试是空壳）",
         ))
         if not caught:
-            failures += 1
+            missed += 1
 
     restored = run_pytest()
     print(f"还原后: exit={restored}  {'✅ 绿' if restored == 0 else '❌ 红'}")
@@ -117,13 +209,14 @@ def main() -> int:
         print(f"{mid}  {verdict}\n     {desc}")
     print("=" * 78)
     print(
-        f"结果：{len(MUTATIONS) - failures}/{len(MUTATIONS)} 个变异被抓到"
-        + ("" if failures == 0 else f"，{failures} 个漏网 ⚠️")
+        f"结果：{len(MUTATIONS) - missed}/{len(MUTATIONS)} 个变异被抓到"
+        + ("" if missed == 0 else f"，{missed} 个漏网 ⚠️")
     )
+
     if restored != 0:
-        print("⚠️ 还原后测试不绿 —— 源码可能没恢复干净，检查 .bak-mutation")
+        print("⚠️ 还原后测试不绿 —— 源码可能没恢复干净")
         return 3
-    return 0 if failures == 0 else 1
+    return 0 if missed == 0 else 1
 
 
 if __name__ == "__main__":

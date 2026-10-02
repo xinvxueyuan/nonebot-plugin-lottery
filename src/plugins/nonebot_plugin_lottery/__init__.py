@@ -7,36 +7,53 @@
     群员发送 ``抽奖`` → 在 ``[MIN, MAX]`` 里随机取一个分钟数 → **禁言自己**
     → 回复「恭喜 xxx 参与"抽奖"！🎉 获得了 N分钟禁言大礼包 🎉」
 
-用户 2026-10-02 追加要求：**「原样但超 10 分钟的定时自动解禁（隐性）」**。
-落地方式有两层，缺一不可（原因见下）：
+用户 2026-10-02 追加要求：**「原样但超 10 分钟的定时自动解禁（隐性）」**，
+且必须**用 nonebot-plugin-apscheduler 实现并做容灾持久化**。
 
-    1. 实际禁言时长 = ``min(抽到的数, LOTTERY_MUTE_CAP_MINUTES)``
-       —— 让**平台侧**自己到期解开，不依赖本进程活着。
-    2. 抽到的数 > 上限时，**额外**挂一个定时任务在 +上限 分钟时解禁
-       （``set_group_ban(duration=0)``，幂等）。
+⚠️ 落地方式是「**到时间再调用 API 解禁**」，**不是**「把禁言时长砍成 10 分钟」
+（用户后来明确纠正过这一点）：
 
-⚠️ 为什么不能只靠第 2 层的定时任务：apscheduler 的任务是**进程内内存态**，
-qbot 重启（这台机器 3 天里重启过 12 次）就丢了 —— 那被抽到 480 分钟的人
-会被真关 8 小时。把封顶做进 ``duration`` 之后，无论 bot 死没死，用户最多
-被关 10 分钟；定时任务退化成「更精确的兜底」。
+    1. 禁言时长 = **抽到的原始值**（例如 480 分钟就真禁 480）—— 不做任何封顶。
+    2. 抽到的值 > 阈值时，挂一个 apscheduler 一次性任务，在 +阈值 分钟时
+       调 ``set_group_ban(duration=0)`` **主动解禁**（幂等）。
 
-⚠️ 「隐性」的含义：**回复里报的仍是抽到的原始数字**（保留原插件的玩笑效果），
-不告诉群里「其实只关了 10 分钟」。
+## 容灾（重启不丢解禁任务）
+
+apscheduler 的任务默认只在进程内存里，bot 一重启就没了 —— 被抽到 480 分钟的人
+会被真关 8 小时。所以真相落在 sqlite（``store.py`` 的 ``lottery_pending_unmute`` 表），
+apscheduler 只当调度器：
+
+    抽奖命中 → 写一条待解禁记录（绝对时刻 unmute_at / expire_at）+ 挂任务
+    启动时   → 读表：未到期的重建任务；已过期但还没自然到期的立刻解禁；
+               连 expire_at 都过了的（平台早解开）直接清掉，不打扰 API
+    解禁成功 → 删记录；失败（bot 离线等）→ 累加 attempts 并在 60 秒后重试
+
+为什么不用 apscheduler 自带的持久化 jobstore（``SQLAlchemyJobStore``）：
+它靠 pickle 存函数引用串、恢复时 ``__import__(模块名)``，而宿主用
+``load_from_toml()`` 加载 vendor 插件时模块名是带连字符的**合成名**
+（``vendor.nonebot-plugin-lottery.src.plugins.nonebot_plugin_lottery``），
+不是合法标识符 → 实测恢复必然 ``LookupError: could not import module``。
+详见 ``store.py`` 顶部注释。
+
+⚠️ 「隐性」的含义：**回复里报的数字与真实禁言时长一致**（都是抽到的值），
+但群里不会被告知「其实 10 分钟后就会被机器人提前放出来」。
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 from random import randint
+import time
 from typing import TYPE_CHECKING, Final
 
-from nonebot import get_bot, logger, on_command, require
+from nonebot import get_bot, get_driver, logger, on_command, require
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata
 
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
 
+from . import store
 from .config import plugin_config
 
 if TYPE_CHECKING:
@@ -67,27 +84,30 @@ lottery_cmd = on_command("抽奖", priority=5, block=True)
 _FAILED_MSG: Final[str] = "抽奖禁言失败，可能是机器人没有禁言权限"
 _JOB_ID_FMT: Final[str] = "lottery_unmute_{group_id}_{user_id}"
 
+# 解禁失败后的重试间隔与上限。上限存在的意义：bot 长期离线时不要无限重试刷日志；
+# 超过之后禁言通常也已自然到期（抽到的时长至少 10 分钟起）。
+_RETRY_DELAY_SECONDS: Final[int] = 60
+_MAX_UNMUTE_ATTEMPTS: Final[int] = 20
+# apscheduler 错过触发时间的容忍窗口（超过就不补跑，交给容灾表下次启动处理）
+_MISFIRE_GRACE_SECONDS: Final[int] = 300
+
 
 def pick_mute_minutes(
     minimum: int,
     maximum: int,
-    cap: int,
     *,
     rng: Callable[[int, int], int] | None = None,
-) -> tuple[int, int]:
-    """抽时间。
+) -> int:
+    """抽禁言时长（分钟）。
 
-    Returns:
-        ``(报出来的分钟数, 实际禁言的分钟数)``。
-        前者是抽到的原始值（回复里报它，保留原插件的玩笑效果）；
-        后者封顶到 ``cap``，保证群里最多被关 ``cap`` 分钟。
+    **禁言就按这个值下** —— 没有封顶。用户 2026-10-02 明确要求：
+    「不是调用平台 API 禁言 10 分钟，是到时间再调用 API 解禁」。
 
-    抽纯函数是为了能直接单测 —— 随机 + 封顶这两件事一旦写错，
-    表现是「有人被关 8 小时」，只在生产才会发现。
+    抽成纯函数是为了能注入 ``rng`` 做确定性断言（抽奖逻辑只在生产才跑到，
+    写错了就是「有人被关 8 小时」这种只能事后补救的事故）。
     """
     pick = rng or randint
-    rolled = pick(minimum, maximum)
-    return rolled, min(rolled, cap)
+    return pick(minimum, maximum)
 
 
 async def _member_nickname(bot: Bot, group_id: int, user_id: int) -> str:
@@ -106,83 +126,236 @@ async def _member_nickname(bot: Bot, group_id: int, user_id: int) -> str:
 
 
 async def _unmute(bot_id: str, group_id: int, user_id: int) -> None:
-    """定时解禁任务体：把用户从禁言里放出来。
+    """定时解禁任务体：到点了主动调用 API 把人放出来。
 
-    ⚠️ 任务在 **+上限分钟** 后才跑，那时手里的 ``Bot`` 对象可能已经因重连失效，
-    所以这里用 ``get_bot(bot_id)`` 取**当前**实例。取不到（bot 离线/重启）就
-    静默放弃 —— 平台侧的 ``duration`` 已经把上限封死了，用户不会被关更久。
+    ⚠️ 这个函数就是「自动解禁」的**唯一实现**：禁言是按抽到的时长下的
+    （例如 480 分钟），不靠平台自然到期，而是由这里提前 ``set_group_ban(duration=0)``
+    解开。
+
+    任务在 +N 分钟后才跑，那时手里的 ``Bot`` 对象可能已经因重连失效，
+    所以用 ``get_bot(bot_id)`` 取**当前**实例。
+
+    **失败时不再「放弃」**（这是容灾的一部分）：bot 离线 / API 抖动都只说明
+    「这一刻放不出去」，记录仍在表里，所以累加 attempts 并在 60 秒后重试；
+    重试到上限才放弃并删记录（那时禁言已经自然过了一大半，且持续重试会刷日志）。
     """
+    _ensure_store()
     try:
         bot = get_bot(bot_id)
     except Exception:
-        logger.warning(
-            "抽奖解禁任务：bot {} 不可用，跳过解禁（平台侧已按封顶时长自动解禁）",
-            bot_id,
-        )
+        logger.warning("抽奖解禁：bot {} 暂时不可用，60 秒后重试", bot_id)
+        _retry_later(bot_id, group_id, user_id)
         return
+
     try:
         await bot.set_group_ban(group_id=group_id, user_id=user_id, duration=0)
     except Exception:
-        logger.exception("抽奖定时解禁失败 group={} user={}", group_id, user_id)
+        logger.exception(
+            "抽奖解禁失败 group={} user={}，60 秒后重试", group_id, user_id
+        )
+        _retry_later(bot_id, group_id, user_id)
         return
+
+    store.remove_pending(group_id, user_id)
     logger.info("抽奖定时解禁完成 group={} user={}", group_id, user_id)
 
 
-def _schedule_unmute(bot: Bot, group_id: int, user_id: int, minutes: int) -> None:
-    """挂一个一次性解禁任务（失败只 warning，不影响已生效的封顶禁言）。"""
+def _retry_later(bot_id: str, group_id: int, user_id: int) -> None:
+    """解禁失败后重排一次重试；超过上限则清掉记录（避免无限重试刷日志）。"""
+    attempts = store.bump_attempts(group_id, user_id)
+    if attempts > _MAX_UNMUTE_ATTEMPTS:
+        store.remove_pending(group_id, user_id)
+        logger.error(
+            "抽奖解禁连续失败 {} 次，放弃 group={} user={}"
+            "（禁言将按抽到的时长自然到期）",
+            attempts,
+            group_id,
+            user_id,
+        )
+        return
+    _add_unmute_job(
+        bot_id,
+        group_id,
+        user_id,
+        when=datetime.now() + timedelta(seconds=_RETRY_DELAY_SECONDS),
+    )
+
+
+def _ensure_store() -> None:
+    """确保容灾库已就绪（懒初始化，幂等）。
+
+    正常情况下由启动钩子 ``_on_startup`` 初始化；这里再兜一层是因为
+    「启动钩子没跑但 handler 被调了」不该让抽奖功能整个挂掉
+    （代价只是一次多余的 init，而 init 本身是幂等的）。
+
+    测试通过事先 ``store.init(tmp_path)`` 抢占，不会被这里覆盖
+    （``is_initialized()`` 为真就跳过）。
+    """
+    if store.is_initialized():
+        return
+    try:
+        store.init(store.default_db_path())
+    except Exception:
+        logger.exception("抽奖容灾库初始化失败（本次抽奖将无法持久化解禁任务）")
+
+
+def _add_unmute_job(
+    bot_id: str, group_id: int, user_id: int, *, when: datetime
+) -> None:
+    """把一条解禁任务交给 apscheduler（**不含**持久化，持久化由 store 负责）。
+
+    失败只 warning：禁言本身已经生效，而待解禁记录仍在表里，
+    下次启动/重试仍会把它捞回来。
+    """
     job_id = _JOB_ID_FMT.format(group_id=group_id, user_id=user_id)
     try:
         scheduler.add_job(
             _unmute,
             trigger="date",
-            run_date=datetime.now() + timedelta(minutes=minutes),
-            args=[str(bot.self_id), group_id, user_id],
+            run_date=when,
+            args=[bot_id, group_id, user_id],
             id=job_id,
             replace_existing=True,
-            misfire_grace_time=60,
+            misfire_grace_time=_MISFIRE_GRACE_SECONDS,
             coalesce=True,
         )
     except Exception:
         logger.exception(
-            "抽奖定时解禁任务挂载失败 group={} user={}（禁言仍按封顶时长生效）",
+            "抽奖解禁任务挂载失败 group={} user={}（记录已落库，重启时会重建）",
             group_id,
             user_id,
         )
-        return
+
+
+def _schedule_unmute(
+    bot: Bot, group_id: int, user_id: int, minutes: int, *, ban_minutes: int
+) -> None:
+    """落库 + 挂任务。**先落库再挂任务** —— 反过来的话，两步之间崩了就没有真相。
+
+    Args:
+        bot: 当前 bot 实例（只取其 ``self_id``，不持有它）。
+        group_id: 群号。
+        user_id: 被禁言的群员。
+        minutes: 多久之后解禁（阈值）。
+        ban_minutes: 本次禁言的完整时长（抽到的值），用来算「自然到期时刻」。
+    """
+    _ensure_store()
+    now = datetime.now()
+    unmute_at = now + timedelta(minutes=minutes)
+    expire_at = now + timedelta(minutes=ban_minutes)
+
+    store.save_pending(
+        bot_id=str(bot.self_id),
+        group_id=group_id,
+        user_id=user_id,
+        unmute_at=unmute_at.timestamp(),
+        expire_at=expire_at.timestamp(),
+    )
+    _add_unmute_job(str(bot.self_id), group_id, user_id, when=unmute_at)
     logger.info(
-        "抽奖：user={} 在群 {} 抽中超时，已于 {} 分钟后挂自动解禁",
+        "抽奖：user={} 在群 {} 被禁言 {} 分钟，已落库并挂 {} 分钟后的自动解禁",
         user_id,
         group_id,
+        ban_minutes,
         minutes,
     )
 
 
+async def restore_pending_from_store() -> None:
+    """启动时从容灾表重建解禁任务（**这是「重启不丢解禁」的关键**）。
+
+    三种情况分开处理：
+
+    | 记录状态 | 处理 |
+    |---|---|
+    | `unmute_at` 还没到 | 按原时刻重建任务 |
+    | `unmute_at` 已过、`expire_at` 未到 | **立刻**解禁（停机期间本该解禁的） |
+    | `expire_at` 也已过 | 平台早按抽到的时长自然解开了 → 直接删记录，不调 API |
+
+    最后一种很重要：bot 停机好几小时后再重启，那些禁言早就到期了，
+    再去调解禁 API 是纯粹的无用调用。
+    """
+    _ensure_store()
+    rows = store.all_pending()
+    if not rows:
+        return
+
+    now = time.time()
+    rebuilt = overdue = cleaned = 0
+    for row in rows:
+        group_id, user_id = int(row["group_id"]), int(row["user_id"])
+        bot_id = str(row["bot_id"])
+        unmute_at, expire_at = float(row["unmute_at"]), float(row["expire_at"])
+
+        if expire_at <= now:
+            store.remove_pending(group_id, user_id)
+            cleaned += 1
+            continue
+
+        when = datetime.fromtimestamp(unmute_at)
+        if unmute_at <= now:
+            when = datetime.now()  # 停机期间错过了，立刻补上
+            overdue += 1
+        else:
+            rebuilt += 1
+        _add_unmute_job(bot_id, group_id, user_id, when=when)
+
+    logger.info(
+        "抽奖容灾：恢复 {} 条待解禁（其中 {} 条已过期立即执行），"
+        "清理 {} 条自然到期的记录",
+        rebuilt + overdue,
+        overdue,
+        cleaned,
+    )
+
+
+async def _on_startup() -> None:
+    """插件启动钩子：定库路径 + 从持久化记录重建解禁任务。
+
+    ⚠️ 干跑（只 `import bot` 不 `run()`）**不会**触发这里，所以生产干跑
+    不会碰到数据库，也不会有任务被挂起。
+    """
+    _ensure_store()
+    await restore_pending_from_store()
+
+
+if plugin_config.lottery_persist_pending:
+    get_driver().on_startup(_on_startup)
+
+
 @lottery_cmd.handle()
 async def _handle_lottery(bot: Bot, event: GroupMessageEvent) -> None:
-    """抽奖主流程：随机时长 → 禁言自己 → 回复。"""
-    rolled, actual = pick_mute_minutes(
+    """抽奖主流程：随机时长 → 按该时长禁言自己 → 回复（超阈值则挂定时解禁）。"""
+    rolled = pick_mute_minutes(
         plugin_config.lottery_min_mute_time,
         plugin_config.lottery_max_mute_time,
-        plugin_config.lottery_mute_cap_minutes,
     )
+    unmute_after = plugin_config.lottery_unmute_after_minutes
 
     try:
         user_name = await _member_nickname(bot, event.group_id, event.user_id)
+        # 禁言时长**就是**抽到的值（不做封顶）：用户要的是「到时间再调 API 解禁」，
+        # 而不是「只禁 10 分钟」。
         await bot.set_group_ban(
             group_id=event.group_id,
             user_id=event.user_id,
-            duration=actual * 60,
+            duration=rolled * 60,
         )
     except Exception:
         # 常见原因：bot 不是管理员 / 目标是群主 / 权限不足。
         logger.exception("抽奖禁言失败 group={} user={}", event.group_id, event.user_id)
         await lottery_cmd.finish(_FAILED_MSG)
 
-    if rolled > actual:
-        _schedule_unmute(bot, event.group_id, event.user_id, actual)
+    # 只在「抽到的时长超过阈值」时才需要提前解禁；没超的话等平台自然到期即可。
+    if rolled > unmute_after:
+        _schedule_unmute(
+            bot,
+            event.group_id,
+            event.user_id,
+            unmute_after,
+            ban_minutes=rolled,
+        )
 
-    # ⚠️ 报的是 `rolled`（抽到的原始值）而不是 `actual` —— 这是「隐性」的要求：
-    #    群里看到的就是原插件的玩笑效果，封顶不对外说。
     await lottery_cmd.finish(
         f'恭喜 {user_name}({event.user_id}) 参与"抽奖"！\n'
         f"🎉 获得了 {rolled}分钟禁言大礼包 🎉"
