@@ -10,9 +10,18 @@
 任何测试模块 import 插件之前。
 """
 
+import os
+
 import nonebot
 from nonebot.adapters.onebot.v11 import Adapter
 import pytest
+
+# ⚠️ 必须在 `nonebot.init()` **之前**用**环境变量 JSON** 设置（2026-10-06 补）：
+#   ① 生产 qbot 的 `COMMAND_START` 含**空串**（裸命令，直接发 `抽奖` 就触发），
+#      测试环境不对齐的话，「命令匹配」类用例测的就不是生产的语义；
+#   ② 空串**不能**通过 `nonebot.init(COMMAND_START=["", "/"])` 传 ——
+#      pydantic 会把空字符串丢掉（只剩 `{'/'}`）。走环境变量 JSON 反序列化才保得住。
+os.environ.setdefault("COMMAND_START", '["", "/"]')
 
 # 用 **none 驱动**：单元测试不需要任何服务器/客户端连接，
 # 这样就不必为跑测试装 fastapi+uvicorn 这一大坨。

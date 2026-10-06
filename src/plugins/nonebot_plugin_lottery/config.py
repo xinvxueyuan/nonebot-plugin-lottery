@@ -17,7 +17,7 @@ import logging
 from typing import Final
 
 from nonebot import get_plugin_config
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 logger = logging.getLogger("nonebot_plugin_lottery")
 
@@ -74,6 +74,65 @@ class Config(BaseModel):
         default=True,
         description="是否启用解禁任务的容灾持久化（落 sqlite + 启动时重建任务）",
     )
+
+    # ── 触发词：分「命令词」与「关键词」两轴 ────────────────────────────
+    #
+    # 两者走 NoneBot 的**不同**响应规则，语义不一样（2026-10-06 读引擎源码确认）：
+    #
+    #   command 规则（命令词）→ 只看**消息第一个段**（且必须是文本段），要求它
+    #     以 `COMMAND_START + 词` 开头；`我们抽奖吧` 不匹配、`[图片]抽奖` 也不匹配。
+    #   keyword 规则（关键词）→ 用 `event.get_plaintext()`（**剥离图片/at 段后的
+    #     纯文本**）做「**包含**」判断；`今天自刎归天真好看` 匹配、
+    #     `[图片]自刎归天` 也匹配。
+    #
+    # 所以「网络梗」必须走关键词：它是「消息里模糊带有」，而命令词是「以它开头」。
+    lottery_commands: list[str] = Field(
+        default=["抽奖"],
+        description=(
+            "触发抽奖的**命令词**列表，第一个为主命令、其余为别名"
+            '（如 ["抽奖","禁言抽奖"]）；以它开头（遵循 COMMAND_START）才触发'
+        ),
+    )
+    lottery_keywords: list[str] = Field(
+        default=["自刎归天", "我部悍将刘三刀", "上将潘凤"],
+        description=(
+            "触发抽奖的**关键词**列表：消息纯文本**包含**任一即触发（网络梗用）；"
+            "空列表 = 关闭关键词触发"
+        ),
+    )
+
+    @field_validator("lottery_commands", "lottery_keywords", mode="before")
+    @classmethod
+    def _normalize_word_list(cls, value: object, info: ValidationInfo) -> list[str]:
+        """去首尾空白、丢空项、去重（**保序** —— 顺序决定默认值与文案取词）。
+
+        ⚠️ 这两个字段在 ``.env`` 里必须写成 **JSON 数组**：
+
+            LOTTERY_COMMANDS=["抽奖","禁言抽奖"]
+            LOTTERY_KEYWORDS=["自刎归天"]
+
+        NoneBot 对自定义键统一走 ``json.loads``，所以写成裸值
+        （``LOTTERY_KEYWORDS=自刎归天``）
+        会在**解析 env 阶段**就抛 ``JSONDecodeError`` 让进程起不来 —— 那发生在
+        本校验器之前，这里拦不到，只能靠文档说清。清空要写 ``[]``，不能写裸空。
+        """
+        if value is None:
+            return []
+        if isinstance(value, str):  # 单个词也容忍（虽然 env 里到不了这一步）
+            value = [value]
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        out: list[str] = []
+        for item in value:
+            word = str(item).strip()
+            if word and word not in out:
+                out.append(word)
+            elif not word:
+                logger.warning(
+                    "LOTTERY_%s 里有空白项，已忽略",
+                    (info.field_name or "?").removeprefix("lottery_").upper(),
+                )
+        return out
 
     @model_validator(mode="after")
     def _fix_inverted_range(self) -> Config:

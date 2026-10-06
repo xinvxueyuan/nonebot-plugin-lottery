@@ -46,8 +46,16 @@ from random import randint
 import time
 from typing import TYPE_CHECKING, Final
 
-from nonebot import get_bot, get_driver, logger, on_command, require
+from nonebot import (
+    get_bot,
+    get_driver,
+    logger,
+    on_command,
+    on_keyword,
+    require,
+)
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+from nonebot.params import Command, Keyword
 from nonebot.plugin import PluginMetadata
 
 require("nonebot_plugin_apscheduler")
@@ -59,12 +67,29 @@ from .config import plugin_config
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from nonebot.matcher import Matcher
+
+
+def _usage_text() -> str:
+    """用法说明由**配置里的词**生成 —— 改了触发词，菜单/帮助里的文案跟着变。"""
+    lines = ["指令："]
+    lines += [
+        f"  - {w}    (直接参与抽奖并被随机禁言)"
+        for w in plugin_config.lottery_commands
+    ]
+    lines += [
+        f"  - 消息里包含「{w}」    (同上, 网络梗触发)"
+        for w in plugin_config.lottery_keywords
+    ]
+    if len(lines) == 1:
+        lines.append("  (未配置任何命令词/关键词 —— 本插件不会响应任何消息)")
+    return "\n".join(lines)
+
+
 __plugin_meta__ = PluginMetadata(
     name="抽奖",
     description="参与抽奖的群员会被随机禁言一段时间, 我看看谁这么贱",
-    usage="""指令：
-  - 抽奖    (直接参与抽奖并被随机禁言)
-""".strip(),
+    usage=_usage_text(),
     type="application",
     homepage="https://github.com/xinvxueyuan/nonebot-plugin-lottery",
     supported_adapters={"nonebot.adapters.onebot.v11"},
@@ -73,15 +98,64 @@ __plugin_meta__ = PluginMetadata(
         "author": "阿珏酱",
         "maintainer": "xinvxueyuan",
         "upstream": "zhenxun_bot zhenxun/plugins/lottery",
-        "version": "1.1",
+        "version": "1.2",
         "menu_type": "群内小游戏",
-        "commands": [{"command": "抽奖"}],
+        # 菜单里的命令词同样来自配置（同上：不再硬编码）
+        "commands": [{"command": w} for w in plugin_config.lottery_commands],
+        "keywords": list(plugin_config.lottery_keywords),
     },
 )
 
-lottery_cmd = on_command("抽奖", priority=5, block=True)
+# ── 两个响应器：命令词 / 关键词 ─────────────────────────────────────
+#
+# ⚠️ 必须分成**两个 matcher 且优先级错开**，不能合成一个（2026-10-06 读引擎源码确认）：
+#
+#   ① 合不起来：`nonebot/internal/rule.py` 的 `Rule.__or__` 直接抛
+#      `RuntimeError("Or operation between rules is not allowed.")`，NoneBot
+#      **不支持规则之间取或**；且 `Rule` 没有 `__invert__`，所以
+#      「关键词 且 不是命令」这种排除写法同样表达不出来。
+#   ② 同优先级会双触发：`nonebot/message.py::handle_event` 对**同一优先级**下的所有
+#      matcher 是 `tg.start_soon` **并发跑完**的，`block` 只用来跳过后面的**更低**优先级
+#      —— 两个 matcher 同优先级时，一条同时命中两者的消息会被**各处理一次**
+#      （禁言两次 + 回两条）。
+#   ③ 所以：命令 matcher 用 priority=5（沿用原值）、命中即 `block=True` 阻断整条
+#      事件传播，关键词 matcher 退到 priority=6 ⇒ 一条消息**最多只被处理一次**，
+#      且**命令优先**
+#      （`抽奖 自刎归天` 只按命令走一次）。
+_COMMAND_PRIORITY: Final[int] = 5
+_KEYWORD_PRIORITY: Final[int] = 6
 
-_FAILED_MSG: Final[str] = "抽奖禁言失败，可能是机器人没有禁言权限"
+_PRIMARY_COMMAND: Final[str] = (
+    plugin_config.lottery_commands[0] if plugin_config.lottery_commands else ""
+)
+
+lottery_cmd: type[Matcher] | None = None
+if plugin_config.lottery_commands:
+    lottery_cmd = on_command(
+        plugin_config.lottery_commands[0],
+        aliases=set(plugin_config.lottery_commands[1:]),
+        priority=_COMMAND_PRIORITY,
+        block=True,
+    )
+
+lottery_keyword: type[Matcher] | None = None
+if plugin_config.lottery_keywords:
+    # `on_keyword` 走 keyword 规则 = 纯文本「包含」
+    #（`get_plaintext()` 已剥离图片/at 段）。
+    # ⚠️ 它的 `block` 默认就是 True（on_message 的默认），这里显式写出来 ——
+    #    与 command 规则的默认（False）**相反**，不写会让人以为两者一致。
+    lottery_keyword = on_keyword(
+        set(plugin_config.lottery_keywords),
+        priority=_KEYWORD_PRIORITY,
+        block=True,
+    )
+
+if lottery_cmd is None and lottery_keyword is None:
+    logger.warning(
+        "LOTTERY_COMMANDS 与 LOTTERY_KEYWORDS 都是空的 —— 抽奖不会响应任何消息；"
+        '要恢复请把 LOTTERY_COMMANDS 写回 ["抽奖"]'
+    )
+
 _JOB_ID_FMT: Final[str] = "lottery_unmute_{group_id}_{user_id}"
 
 # 解禁失败后的重试间隔与上限。上限存在的意义：bot 长期离线时不要无限重试刷日志；
@@ -342,9 +416,30 @@ if plugin_config.lottery_persist_pending:
     get_driver().on_startup(_on_startup)
 
 
-@lottery_cmd.handle()
-async def _handle_lottery(bot: Bot, event: GroupMessageEvent) -> None:
-    """抽奖主流程：随机时长 → 按该时长禁言自己 → 回复（超阈值则挂定时解禁）。"""
+def _failed_msg(word: str) -> str:
+    """禁言失败文案。
+
+    用**主命令词**而不是「实际命中的词」：这句在说「这个功能失败了」，不是在选择触发词；
+    网络梗（可能很长）填进去读起来不通顺。默认配置下与旧版文案**逐字一致**。
+    """
+    return f"{_PRIMARY_COMMAND or word}禁言失败，可能是机器人没有禁言权限"
+
+
+async def _run_lottery(
+    bot: Bot,
+    event: GroupMessageEvent,
+    word: str,
+    matcher: type[Matcher],
+) -> None:
+    """抽奖主流程：随机时长 → 按该时长禁言自己 → 回复（超阈值则挂定时解禁）。
+
+    `word` 是**实际命中的那个词**（命令词或关键词），只用于回复文案 ——
+    用户要求「把匹配词做成配置后，回复文案跟着变」。
+
+    `matcher` 是**正在处理这条消息的那个响应器**：命令与关键词是两个 matcher，
+    `finish()` 必须打在正确的那个上（用户要求表态/回复都发生在消息发出之后，
+    这里 `finish()` 既发消息又结束控制流，打在错误的 matcher 上会行为不一致）。
+    """
     rolled = pick_mute_minutes(
         plugin_config.lottery_min_mute_time,
         plugin_config.lottery_max_mute_time,
@@ -363,7 +458,7 @@ async def _handle_lottery(bot: Bot, event: GroupMessageEvent) -> None:
     except Exception:
         # 常见原因：bot 不是管理员 / 目标是群主 / 权限不足。
         logger.exception("抽奖禁言失败 group={} user={}", event.group_id, event.user_id)
-        await lottery_cmd.finish(_FAILED_MSG)
+        await matcher.finish(_failed_msg(word))
 
     # 只在「抽到的时长超过阈值」时才需要提前解禁；没超的话等平台自然到期即可。
     if rolled > unmute_after:
@@ -375,10 +470,37 @@ async def _handle_lottery(bot: Bot, event: GroupMessageEvent) -> None:
             ban_minutes=rolled,
         )
 
-    await lottery_cmd.finish(
-        f'恭喜 {user_name}({event.user_id}) 参与"抽奖"！\n'
+    await matcher.finish(
+        f'恭喜 {user_name}({event.user_id}) 参与"{word}"！\n'
         f"🎉 获得了 {rolled}分钟禁言大礼包 🎉"
     )
+
+
+if lottery_cmd is not None:
+    _cmd_matcher = lottery_cmd
+
+    @_cmd_matcher.handle()
+    async def _handle_lottery_command(
+        bot: Bot,
+        event: GroupMessageEvent,
+        cmd: tuple[str, ...] = Command(),
+    ) -> None:
+        """命令触发（`抽奖` / 别名）。`Command` 给出**实际命中的那个命令词**。"""
+        word = cmd[0] if cmd else _PRIMARY_COMMAND
+        await _run_lottery(bot, event, word, _cmd_matcher)
+
+
+if lottery_keyword is not None:
+    _kw_matcher = lottery_keyword
+
+    @_kw_matcher.handle()
+    async def _handle_lottery_keyword(
+        bot: Bot,
+        event: GroupMessageEvent,
+        word: str = Keyword(),
+    ) -> None:
+        """关键词触发（网络梗）。`Keyword` 给出**实际命中的那个关键词**。"""
+        await _run_lottery(bot, event, word or _PRIMARY_COMMAND, _kw_matcher)
 
 
 __all__: list[str] = [

@@ -17,9 +17,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
-from nonebot.adapters.onebot.v11 import GroupMessageEvent
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 import pytest
+
+if TYPE_CHECKING:
+    from nonebot.matcher import Matcher
 
 from nonebot_plugin_lottery import pick_mute_minutes, plugin_config
 from nonebot_plugin_lottery.config import (
@@ -159,12 +163,306 @@ def _registered_commands(matcher) -> set[str]:
     return out
 
 
-def test_command_is_registered():
-    """`抽奖` 命令真的注册上了（裸命令，qbot 的 COMMAND_START 含空串）。"""
+def _registered_keywords(matcher) -> set[str]:
+    """从 matcher 的 rule 里取出注册的关键词（`KeywordsRule.keywords`）。"""
+    out: set[str] = set()
+    for checker in matcher.rule.checkers or ():
+        out.update(getattr(getattr(checker, "call", None), "keywords", ()) or ())
+    return out
+
+
+# ── 触发词来自配置（不再是硬编码）────────────────────────────────────
+
+
+def test_command_words_come_from_config():
+    """`抽奖` 这类触发词**不再是硬编码** —— 全部来自 `lottery_commands`。"""
     from nonebot_plugin_lottery import lottery_cmd
 
-    assert "抽奖" in _registered_commands(lottery_cmd)
+    assert lottery_cmd is not None
+    assert _registered_commands(lottery_cmd) == set(plugin_config.lottery_commands)
     assert lottery_cmd.block is True
+
+
+def test_keyword_words_come_from_config():
+    """网络梗走**关键词**响应器，词表同样来自配置。"""
+    from nonebot_plugin_lottery import lottery_keyword
+
+    assert lottery_keyword is not None
+    assert _registered_keywords(lottery_keyword) == set(plugin_config.lottery_keywords)
+    assert lottery_keyword.block is True
+
+
+def test_keyword_priority_is_lower_than_command():
+    """**核心不变式**：关键词必须在命令**之后**（数字更大）。
+
+    引擎在同一优先级里是 `tg.start_soon` **并发跑完所有 matcher** 的，`block` 只能跳过
+    **更低**优先级。两者同优先级时，一条同时命中两者的消息会被两个 matcher 各处理一次
+    —— 禁言两次 + 回两条。这条断言就是防那个（改优先级的人会在这里被拦下）。
+    """
+    import nonebot_plugin_lottery as plugin
+    from nonebot_plugin_lottery import lottery_cmd, lottery_keyword
+
+    assert lottery_cmd is not None
+    assert lottery_keyword is not None
+    assert plugin._COMMAND_PRIORITY == 5, "命令优先级沿用原值，别顺手改"
+    assert lottery_keyword.priority > lottery_cmd.priority
+
+
+def test_metadata_command_words_come_from_config():
+    """菜单/帮助里列的命令词与关键词也来自配置（用户要求文案跟着变）。"""
+    from nonebot_plugin_lottery import __plugin_meta__
+
+    extra = __plugin_meta__.extra or {}
+    listed = [c["command"] for c in extra.get("commands", [])]
+    assert listed == list(plugin_config.lottery_commands)
+    assert extra.get("keywords") == list(plugin_config.lottery_keywords)
+    usage = __plugin_meta__.usage or ""
+    for w in plugin_config.lottery_commands + plugin_config.lottery_keywords:
+        assert w in usage, f"用法说明里没有配置的词 {w!r}"
+
+
+def test_words_really_come_from_env_config():
+    """**端到端**（另起进程 + 真跑 handler）：env 换词表，文案用**命中的那个词**。
+
+    ⚠️ 必须**另起进程**：`nonebot.init()` 得在 env 设好**之后**跑，而本插件在
+    **模块级**就注册响应器 —— 同进程里改 env 再 import 已经晚了，测出来是假的。
+
+    这里同时钉住三件事（都是变异检验抓出来的必需项）：
+      ① 注册的命令词/关键词跟着 `LOTTERY_COMMANDS` / `LOTTERY_KEYWORDS` 变
+         （写死 `"抽奖"` 时，默认配置下别的用例**照样全绿**，只有这条会红）；
+      ② 回复文案用的是**实际命中的那个词** —— 用「配置里第一个词」代替时，
+         默认配置（只有一个词）看不出区别，所以这里配了
+         **别名** `禁言抽奖`；
+      ③ 失败文案用**主命令词**（= 配置第一个），保证默认配置下与旧版逐字一致。
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import json
+
+        import nonebot
+
+        nonebot.init(driver="~none", log_level="ERROR")
+        from nonebot.adapters.onebot.v11 import Adapter
+
+        nonebot.get_driver().register_adapter(Adapter)
+        import nonebot_plugin_lottery as plugin
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+
+        # 固定随机值且**不超过**解禁阈值 ⇒ 不挂任务、不碰数据库
+        plugin.randint = lambda _a, _b: 3
+
+        replies = []
+
+        async def fake_finish(message=None, **kwargs):
+            replies.append(str(message))
+            raise RuntimeError("__finish__")     # 模拟 finish 结束控制流
+
+        # 类属性赋值：handler 里 `matcher.finish(...)` 走的就是它
+        plugin.lottery_cmd.finish = fake_finish
+        plugin.lottery_keyword.finish = fake_finish
+
+        def build_event(text):
+            return GroupMessageEvent.model_construct(
+                post_type="message",
+                message_type="group",
+                sub_type="normal",
+                group_id=1,
+                user_id=2,
+                message_id=1,
+                message=Message(text),
+                raw_message=text,
+            )
+
+        class Bot:
+            self_id = "1"
+
+            def __init__(self, ban_ok=True):
+                self.ban_ok = ban_ok
+
+            async def get_group_member_info(self, *, group_id, user_id):
+                return {"card": "阿百川", "nickname": "大鬼"}
+
+            async def set_group_ban(self, *, group_id, user_id, duration):
+                if not self.ban_ok:
+                    raise RuntimeError("no permission")
+
+        async def call(handler, *args):
+            try:
+                await handler(*args)
+            except RuntimeError:
+                pass
+
+        def commands(matcher):
+            out = set()
+            for checker in (matcher.rule.checkers or ()):
+                cmds = getattr(getattr(checker, "call", None), "cmds", ()) or ()
+                for group in cmds:
+                    out.update([group] if isinstance(group, str) else group)
+            return out
+
+        def keywords(matcher):
+            out = set()
+            for checker in (matcher.rule.checkers or ()):
+                rule = getattr(checker, "call", None)
+                out.update(getattr(rule, "keywords", ()) or ())
+            return out
+
+        async def main():
+            event = build_event("抽奖")
+            # ① 命中**别名**（不是配置里第一个词）
+            await call(plugin._handle_lottery_command, Bot(), event, ("禁言抽奖",))
+            # ② 命中主命令词
+            await call(plugin._handle_lottery_command, Bot(), event, ("抽奖",))
+            # ③ 命中关键词
+            await call(plugin._handle_lottery_keyword, Bot(), event, "俺也一样")
+            # ④ 失败路径（bot 没有禁言权限）
+            no_perm = Bot(ban_ok=False)
+            await call(plugin._handle_lottery_command, no_perm, event, ("抽奖",))
+
+        asyncio.run(main())
+
+        meta = plugin.__plugin_meta__
+        payload = {
+            "commands": sorted(commands(plugin.lottery_cmd)),
+            "keywords": sorted(keywords(plugin.lottery_keyword)),
+            "meta_commands": [
+                c["command"] for c in (meta.extra or {}).get("commands", [])
+            ],
+            "usage": meta.usage,
+            "replies": replies,
+        }
+        print("RESULT:" + json.dumps(payload, ensure_ascii=False))
+        """
+    )
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env["LOTTERY_COMMANDS"] = '["禁言抽奖","抽奖"]'
+    env["LOTTERY_KEYWORDS"] = '["俺也一样","自刎归天"]'
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=180,
+        env=env,
+        check=True,
+    )
+    result = next(ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT:"))
+    data = json.loads(result.removeprefix("RESULT:"))
+
+    # ① 词表跟着配置变
+    assert data["commands"] == ["抽奖", "禁言抽奖"], "命令词没跟着配置变"
+    assert data["keywords"] == ["俺也一样", "自刎归天"], "关键词没跟着配置变"
+    assert data["meta_commands"] == ["禁言抽奖", "抽奖"], "菜单顺序应等于配置顺序"
+    assert "禁言抽奖" in data["usage"]
+    assert "俺也一样" in data["usage"]
+
+    replies = data["replies"]
+    assert len(replies) == 4, f"应有 4 条回复，实际 {replies}"
+    # ② 文案用**命中的词**：命中别名时写别名，不能写主命令词
+    assert '参与"禁言抽奖"！' in replies[0], replies[0]
+    assert '参与"抽奖"！' in replies[1], replies[1]
+    assert '参与"俺也一样"！' in replies[2], replies[2]
+    # ③ 失败文案用主命令词（= 配置第一个），默认配置下与旧版逐字一致
+    assert replies[3] == "禁言抽奖禁言失败，可能是机器人没有禁言权限", replies[3]
+
+
+# ── 匹配语义：拿**真事件**过**真规则**（不测字符串，测 NoneBot 的真实行为）──
+
+
+def _text_event(plaintext: str) -> GroupMessageEvent:
+    """带 `message` 的真群聊事件（命令/关键词规则都读它）。"""
+    return GroupMessageEvent.model_construct(
+        post_type="message",
+        message_type="group",
+        sub_type="normal",
+        group_id=1094538078,
+        user_id=10001,
+        message_id=1,
+        message=Message(plaintext),
+        raw_message=plaintext,
+    )
+
+
+async def _rule_matches(matcher, plaintext: str) -> bool:
+    """按引擎的方式跑一遍该 matcher 的 rule。
+
+    ⚠️ 必须先 `TrieRule.get_value` —— `nonebot/message.py::handle_event` 在跑 rule
+    之前就会做这一步把命令解析结果写进 state（`command` 规则依赖它），
+    漏了的话命令规则**恒不匹配**，测试会给出「配置没生效」的假结论。
+    """
+    from nonebot.rule import TrieRule
+
+    event = _text_event(plaintext)
+    state: dict = {}
+    TrieRule.get_value(None, event, state)
+    return bool(await matcher.rule(None, event, state))
+
+
+@pytest.mark.parametrize(
+    ("plaintext", "expected"),
+    [
+        ("抽奖", True),
+        ("/抽奖", True),          # COMMAND_START 含 "/"
+        (" 抽奖", True),          # 首段 lstrip 后匹配
+        ("我们抽奖吧", False),      # 命令只在**开头**匹配
+        ("我要抽奖", False),
+        ("[CQ:image,file=x.jpg]抽奖", False),  # 首段不是文本段 → 命令规则不匹配
+        ("无关消息", False),
+    ],
+)
+async def test_command_rule_matching(plaintext, expected):
+    """命令规则的**真实语义**：只看消息第一个段，且必须以 COMMAND_START + 词开头。"""
+    from nonebot_plugin_lottery import lottery_cmd
+
+    assert lottery_cmd is not None
+    assert await _rule_matches(lottery_cmd, plaintext) is expected
+
+
+@pytest.mark.parametrize(
+    ("plaintext", "expected"),
+    [
+        ("自刎归天", True),
+        ("今天自刎归天真好看", True),          # 模糊包含（网络梗的用法）
+        ("[CQ:image,file=x.jpg]自刎归天", True),  # 图片段被剥离 → 仍命中
+        ("[CQ:at,qq=1]自刎归天", True),        # at 段同理
+        ("我部悍将刘三刀在此", True),
+        ("无关消息", False),
+    ],
+)
+async def test_keyword_rule_matching(plaintext, expected):
+    """关键词规则的**真实语义**：`get_plaintext()`（剥图片/at 段）做「包含」判断。"""
+    from nonebot_plugin_lottery import lottery_keyword
+
+    assert lottery_keyword is not None
+    assert await _rule_matches(lottery_keyword, plaintext) is expected
+
+
+async def test_keyword_rule_does_not_swallow_plain_messages():
+    """回归：普通聊天消息不该被关键词规则命中（网络梗是罕见串才适合放进去）。"""
+    from nonebot_plugin_lottery import lottery_keyword
+
+    assert lottery_keyword is not None
+    for text in ("今天天气不错", "有人吗", "666", "作业写完了"):
+        assert await _rule_matches(lottery_keyword, text) is False
+
+
+def test_default_keywords_are_rare_strings():
+    """默认网络梗必须是**罕见串**：命中的代价是有人被随机禁言（最长 30 天）。
+
+    放「天意」「大哥」「俺也一样」这种日常高频词进来，群里会天天有人被禁言。
+    """
+    assert all(len(w) >= 4 for w in plugin_config.lottery_keywords), (
+        "默认关键词太短，容易在日常聊天里误伤"
+    )
 
 
 # ── handler：禁言时长 / 解禁任务 ──────────────────────────────────
@@ -257,12 +555,20 @@ def captured(monkeypatch):
     return state
 
 
-async def _run(bot: _FakeBot, event: GroupMessageEvent) -> None:
-    """直接调 handler 函数体（跳过 matcher 派发）。"""
+async def _run(
+    bot: _FakeBot,
+    event: GroupMessageEvent,
+    word: str = "抽奖",
+    matcher: type[Matcher] | None = None,
+) -> None:
+    """直接调 handler 的公共实现（跳过 matcher 派发）。
+
+    `matcher` 默认用命令响应器 —— 各 `captured*` fixture 就是 patch 它的 `finish`。
+    """
     import nonebot_plugin_lottery as plugin
 
     with pytest.raises(Exception):  # noqa: B017 - finish() 抛 FinishedException
-        await plugin._handle_lottery(bot, event)
+        await plugin._run_lottery(bot, event, word, matcher or plugin.lottery_cmd)
 
 
 def _ban_duration(bot: _FakeBot) -> int:
@@ -527,16 +833,18 @@ def test_add_unmute_job_swallows_scheduler_failure(monkeypatch):
 
 
 def test_config_is_actually_used_by_the_handler():
-    """Handler 读的是 `plugin_config`，不是写死的常量。"""
+    """Handler 读的是 `plugin_config`，不是写死的常量（含**触发词**）。"""
     import inspect
 
     import nonebot_plugin_lottery as plugin
 
-    src = inspect.getsource(plugin._handle_lottery)
+    src = inspect.getsource(plugin._run_lottery)
     assert "plugin_config.lottery_min_mute_time" in src
     assert "plugin_config.lottery_max_mute_time" in src
     assert "plugin_config.lottery_unmute_after_minutes" in src
     assert plugin_config.lottery_unmute_after_minutes == 10
+    # 触发词也不许再出现硬编码字面量（回归：别把 "抽奖" 写回响应器）
+    assert '"抽奖"' not in src
 
 
 # ── NoneBot 依赖注入：注解必须**运行时可解析** ────────────────────
@@ -550,19 +858,91 @@ def test_handler_annotations_resolve_to_real_classes_at_runtime():
     解析出来就不是类对象 → bot/event 注入失败。
 
     ⚠️ 这类错误**只在生产暴露**（本地直接调 handler 的单元测试全绿），
-    所以必须钉一条断言住它。
+    所以必须钉一条断言住它。**两个 handler 都要查**（命令 + 关键词）。
     """
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
     from nonebot.dependencies import get_typed_signature
 
     import nonebot_plugin_lottery as plugin
 
-    anns = {
-        name: prm.annotation
-        for name, prm in get_typed_signature(plugin._handle_lottery).parameters.items()
+    for handler in (plugin._handle_lottery_command, plugin._handle_lottery_keyword):
+        anns = {
+            name: prm.annotation
+            for name, prm in get_typed_signature(handler).parameters.items()
+        }
+        assert anns["bot"] is Bot, f"{handler.__name__} 的 bot 注解不是真类"
+        assert anns["event"] is GroupMessageEvent, (
+            f"{handler.__name__} 的 event 注解不是真类"
+        )
+
+
+def test_handlers_read_the_matched_word_from_nonebot_params():
+    """两个 handler 都从 NoneBot 的注入参数取**实际命中的词**（而不是猜/写死）。
+
+    `Command()` → 命中的命令词元组；`Keyword()` → 命中的关键词。
+    猜（比如拿配置里第一个词当文案）在配了别名/多关键词时就会显示错词。
+    """
+    from nonebot.dependencies import get_typed_signature
+
+    import nonebot_plugin_lottery as plugin
+
+    cmd_anns = {
+        n: p.annotation
+        for n, p in get_typed_signature(
+            plugin._handle_lottery_command
+        ).parameters.items()
     }
-    assert anns["bot"] is Bot
-    assert anns["event"] is GroupMessageEvent
+    kw_anns = {
+        n: p.annotation
+        for n, p in get_typed_signature(
+            plugin._handle_lottery_keyword
+        ).parameters.items()
+    }
+    assert cmd_anns["cmd"].__name__ == "tuple"
+    assert kw_anns["word"] is str
+    # 真实默认值必须是 NoneBot 的**依赖对象**（防被人换成普通默认值/写死取词）。
+    # ⚠️ `nonebot.params.Command` / `.Keyword` 是**函数**（不是类）：调用后得到
+    # `DependsInner`，真正的取值函数挂在 `.dependency` 上（`_command` / `_keyword`）。
+    import inspect
+
+    from nonebot.internal.params import DependsInner
+
+    d_cmd = inspect.signature(plugin._handle_lottery_command).parameters["cmd"].default
+    d_kw = inspect.signature(plugin._handle_lottery_keyword).parameters["word"].default
+    assert isinstance(d_cmd, DependsInner)
+    assert isinstance(d_kw, DependsInner)
+    assert d_cmd.dependency.__name__ == "_command"
+    assert d_kw.dependency.__name__ == "_keyword"
+
+
+async def test_reply_text_uses_the_matched_word(captured, monkeypatch):
+    """**用户要求**：回复文案里的词跟着配置/实际命中走。
+
+    命中网络梗时文案要写那个梗，而不是恒写「抽奖」。
+    """
+    import nonebot_plugin_lottery as plugin
+
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 3)
+
+    await _run(_FakeBot(), _group_event(), word="自刎归天")
+
+    assert '参与"自刎归天"！' in captured.messages[-1]
+
+
+async def test_failure_text_uses_the_primary_command_word(captured, monkeypatch):
+    """失败文案用**主命令词**（这句在说功能失败，不是在选择触发词）。
+
+    默认配置下必须与旧版**逐字一致**，别因为这次改造把老文案改掉。
+    """
+    import nonebot_plugin_lottery as plugin
+
+    monkeypatch.setattr(plugin, "randint", lambda _a, _b: 480)
+
+    bot = _FakeBot()
+    bot.ban_error = RuntimeError("机器人不是管理员")
+    await _run(bot, _group_event(), word="自刎归天")
+
+    assert captured.messages[-1] == "抽奖禁言失败，可能是机器人没有禁言权限"
 
 
 # ── 容灾：抽奖命中时必须**落库**（不只是挂内存任务）─────────────────
