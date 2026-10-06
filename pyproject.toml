@@ -28,6 +28,12 @@ dependencies = [
     "nonebot-plugin-localstore>=0.7.4",
 ]
 
+[project.optional-dependencies]
+# CRUD 回复渲染成图（用户 2026-10-06 要求）。**可选**：装不上/加载失败时
+# `render.render_reply()` 返回 None，handle 回退纯文本 —— 绝不让渲染问题
+# 表现成「命令没反应」。
+htmlkit = ["nonebot-plugin-htmlkit==0.1.0rc5"]
+
 [project.urls]
 Homepage = "https://github.com/xinvxueyuan/nonebot-plugin-lottery"
 Repository = "https://github.com/xinvxueyuan/nonebot-plugin-lottery"
@@ -144,6 +150,9 @@ combine-as-imports = true
 # `Bot` / `GroupMessageEvent`（把类型放进 TYPE_CHECKING 块会让注入静默失败，
 # 且只在生产暴露）。所以 TC002 必须放行，不能"照规范"挪走。
 "src/plugins/nonebot_plugin_lottery/__init__.py" = ["TC002"]
+# 同理：`handle.py` 里的 handler 参数用 `MessageEvent` / `Message` 等第三方类型，
+# 它们必须留在运行时导入（放进 TYPE_CHECKING 会让注入在生产静默失效）。
+"src/plugins/nonebot_plugin_lottery/handle.py" = ["TC002"]
 # 变异检验脚本是**给人看的命令行报告**：print 是它的输出通道（T20 在这里是噪音），
 # 它还要打印状态、写备份文件，所以子进程调用与文件写入都放行。
 "scripts/**" = ["T20", "ANN", "S603", "S607", "RUF001", "RUF002", "RUF003", "E501"]

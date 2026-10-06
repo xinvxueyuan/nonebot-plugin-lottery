@@ -31,12 +31,21 @@ apscheduler 的任务默认只在**进程内存**里（`MemoryJobStore`）。bot
 
     lottery_pending_unmute(id, bot_id, group_id, user_id,
                            unmute_at, expire_at, created_at, attempts)
+    lottery_words(id, match_type, word, created_at, created_by)
 
 - `unmute_at`：应该在什么时候解禁（unix 秒，绝对时刻）
 - `expire_at`：这次禁言**自然到期**的时刻（= 禁言开始 + 抽到的时长）。
   ⚠️ 用来判断「还需不需要解禁」：如果 bot 停机太久、`expire_at` 都过了，
   平台早就自动解开了，这时**不该**再去调解禁 API（无意义且会打扰）。
 - `(group_id, user_id)` 唯一：同一个人二次抽奖 = 覆盖旧记录（新禁言覆盖旧禁言）。
+- `lottery_words` 是**运行时匹配词表**（全局一份，不分群）：`match_type` 见
+  `words.MATCH_TYPES`，`(match_type, word)` 唯一（同类型同词不重复插）。
+  单测/生产都靠 `id` 做增删改，所以它是 `AUTOINCREMENT` 且**不重用**已删除的 id
+  （复用会让「查看列表」里记下的 id 指向别的词）。
+
+⚠️ 表用 `CREATE TABLE IF NOT EXISTS` 且**只加不改**：生产库里已经有
+`lottery_pending_unmute`，`init()` 每次都会 `executescript(_SCHEMA)`，
+新建表是安全的（不会动已有数据）；但**绝不要**在这里写 DROP/ALTER。
 """
 
 from __future__ import annotations
@@ -50,9 +59,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     # 注解在 `from __future__ import annotations` 下惰性求值，运行时不需要它。
     # 用 Generator 而非 Iterator：@contextmanager 标 Iterator 已判 deprecated。
-    from collections.abc import Generator
+    from collections.abc import Generator, Sequence
 
 _TABLE = "lottery_pending_unmute"
+_WORDS_TABLE = "lottery_words"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {_TABLE} (
@@ -65,6 +75,15 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     created_at REAL    NOT NULL,
     attempts   INTEGER NOT NULL DEFAULT 0,
     UNIQUE (group_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS {_WORDS_TABLE} (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_type TEXT    NOT NULL,
+    word       TEXT    NOT NULL,
+    created_at REAL    NOT NULL,
+    created_by TEXT    NOT NULL DEFAULT '',
+    UNIQUE (match_type, word)
 );
 """
 
@@ -180,13 +199,121 @@ def count() -> int:
         return int(row["n"]) if row else 0
 
 
+# ── 运行时匹配词表（CRUD 的数据层）──────────────────────────────────
+#
+# 返回值的约定（避免在 store 里拼用户文案 —— 那是 handle 的事）：
+#   add_word     → 新 id；**None = 已存在相同 (类型, 词)**，没插
+#   update_word  → "ok" / "not_found" / "duplicate"
+#   remove_words → 真正删掉的条数
+
+
+def list_words() -> list[sqlite3.Row]:
+    """全部匹配词，**按 id 升序**（这就是匹配顺序，也是列表显示顺序）。"""
+    with _conn() as conn:
+        return conn.execute(
+            f"SELECT id, match_type, word, created_at, created_by"
+            f" FROM {_WORDS_TABLE} ORDER BY id"
+        ).fetchall()
+
+
+def count_words() -> int:
+    """词表条数。"""
+    with _conn() as conn:
+        row = conn.execute(f"SELECT COUNT(*) AS n FROM {_WORDS_TABLE}").fetchone()
+        return int(row["n"]) if row else 0
+
+
+def get_word(word_id: int) -> sqlite3.Row | None:
+    """按 id 取一条；不存在返回 None。"""
+    with _conn() as conn:
+        return conn.execute(
+            f"SELECT id, match_type, word, created_at, created_by"
+            f" FROM {_WORDS_TABLE} WHERE id = ?",
+            (word_id,),
+        ).fetchone()
+
+
+def find_word(match_type: str, word: str) -> sqlite3.Row | None:
+    """按 `(类型, 词)` 精确查一条（用于「是否已存在」的预检与友好提示）。"""
+    with _conn() as conn:
+        return conn.execute(
+            f"SELECT id, match_type, word, created_at, created_by"
+            f" FROM {_WORDS_TABLE} WHERE match_type = ? AND word = ?",
+            (match_type, word),
+        ).fetchone()
+
+
+def add_word(match_type: str, word: str, *, created_by: str = "") -> int | None:
+    """新增一条匹配词，返回新 id；**已存在相同 (类型, 词) 时返回 None**。
+
+    用 `INSERT OR IGNORE` + `rowcount` 而不是先 SELECT 再 INSERT：
+    后者在并发下有窗口（两个管理员同时加同一条会有一个抛 IntegrityError）。
+    """
+    with _conn() as conn:
+        cur = conn.execute(
+            f"INSERT OR IGNORE INTO {_WORDS_TABLE}"
+            " (match_type, word, created_at, created_by) VALUES (?, ?, ?, ?)",
+            (match_type, word, time.time(), created_by),
+        )
+        if cur.rowcount == 0:
+            return None
+        return int(cur.lastrowid or 0)
+
+
+def update_word(word_id: int, match_type: str, word: str) -> str:
+    """按 id 更新类型与词。
+
+    返回 `"ok"` / `"not_found"`（id 不存在）/ `"duplicate"`（改后与**别的**记录重复）。
+    改成自身原值（id 相同、内容相同）算成功。
+    """
+    with _conn() as conn:
+        exists = conn.execute(
+            f"SELECT 1 FROM {_WORDS_TABLE} WHERE id = ?", (word_id,)
+        ).fetchone()
+        if exists is None:
+            return "not_found"
+        clash = conn.execute(
+            f"SELECT id FROM {_WORDS_TABLE}"
+            " WHERE match_type = ? AND word = ? AND id <> ?",
+            (match_type, word, word_id),
+        ).fetchone()
+        if clash is not None:
+            return "duplicate"
+        conn.execute(
+            f"UPDATE {_WORDS_TABLE} SET match_type = ?, word = ? WHERE id = ?",
+            (match_type, word, word_id),
+        )
+        return "ok"
+
+
+def remove_words(word_ids: Sequence[int]) -> int:
+    """按 id 批量删除，返回**真正删掉**的条数（不存在的 id 不计入）。"""
+    ids = list(dict.fromkeys(int(i) for i in word_ids))  # 去重、保序
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with _conn() as conn:
+        cur = conn.execute(
+            f"DELETE FROM {_WORDS_TABLE} WHERE id IN ({placeholders})",
+            ids,
+        )
+        return int(cur.rowcount)
+
+
 __all__ = [
+    "add_word",
     "all_pending",
     "bump_attempts",
     "count",
+    "count_words",
     "default_db_path",
+    "find_word",
+    "get_word",
     "init",
     "is_initialized",
+    "list_words",
     "remove_pending",
+    "remove_words",
     "save_pending",
+    "update_word",
 ]

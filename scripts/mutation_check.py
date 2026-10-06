@@ -22,6 +22,10 @@ TARGETS = {
     "__init__": ROOT / "src/plugins/nonebot_plugin_lottery/__init__.py",
     "store": ROOT / "src/plugins/nonebot_plugin_lottery/store.py",
     "config": ROOT / "src/plugins/nonebot_plugin_lottery/config.py",
+    # v2 的运行时匹配层
+    "handle": ROOT / "src/plugins/nonebot_plugin_lottery/handle.py",
+    "render": ROOT / "src/plugins/nonebot_plugin_lottery/render.py",
+    "words": ROOT / "src/plugins/nonebot_plugin_lottery/words.py",
 }
 
 ENV_PREFIX = (
@@ -184,6 +188,98 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "config",
         "QQ_BAN_MAX_SECONDS: Final[int] = 2_592_000",
         "QQ_BAN_MAX_SECONDS: Final[int] = 43_200",
+    ),
+    # ── v2 运行时匹配层（2026-10-06）────────────────────────────────
+    # 每条都对应一个「改坏了会静默出大事」的点，注释里写了后果。
+    (
+        "M22",
+        "监听器改成 block=True —— 它是 catch-all，会把**所有**群消息吞掉、别的插件再也收不到",
+        "__init__",
+        "priority=plugin_config.lottery_match_priority,\n    block=False,\n)",
+        "priority=plugin_config.lottery_match_priority,\n    block=True,\n)",
+    ),
+    (
+        "M23",
+        "命中后不 stop_propagation —— 引擎同优先级并发跑完所有 matcher，会和别的插件重复处理同一条消息",
+        "__init__",
+        "    matcher.stop_propagation()\n",
+        "    pass  # MUTATED: 不阻断\n",
+    ),
+    (
+        "M24",
+        "用 CQ 原文匹配（而不是 get_plaintext）—— 图片/at 段会被当成正文，正则极易误命中",
+        "__init__",
+        "hit = words.find_match(store.list_words(), event.get_plaintext())",
+        "hit = words.find_match(store.list_words(), str(event.get_message()))",
+    ),
+    (
+        "M25",
+        "CRUD 命令优先级 ≥ 监听器 —— 词表含模糊词「匹配词」时，发「查看匹配词」会既列表又抽奖",
+        "handle",
+        "CRUD_PRIORITY: Final[int] = 3",
+        "CRUD_PRIORITY: Final[int] = 5",
+    ),
+    (
+        "M26",
+        "删除回执「先删再查」—— 查出来全是 None，「已删除 N 条」下面一条都列不出来",
+        "handle",
+        "    snapshot = {i: store.get_word(i) for i in ids}\n",
+        "    store.remove_words(ids)\n    snapshot = {i: store.get_word(i) for i in ids}\n",
+    ),
+    (
+        "M27",
+        "渲染不转义用户输入 —— 匹配词里的 `<`/`&` 会破坏 HTML",
+        "render",
+        "f'<span class=\"word\">{html_mod.escape(r.text)}</span>'",
+        "f'<span class=\"word\">{r.text}</span>'",
+    ),
+    (
+        "M28",
+        "渲染失败时抛异常（不回退）—— 命令会变成「毫无反应」",
+        "render",
+        'logger.warning("抽奖 CRUD 渲染失败，回退纯文本: %s: %s", type(e).__name__, e)\n'
+        "        return None\n",
+        "        raise\n",
+    ),
+    (
+        "M29",
+        "权限闸门放行所有人 —— 普通群成员也能删词",
+        "handle",
+        "    if str(user_id) in {str(u) for u in superusers}:\n        return True",
+        "    return True  # MUTATED: 放行所有人",
+    ),
+    (
+        "M30",
+        "写入时不校验正则 —— 坏正则在每条消息上都抛一次，规则永远静默失效",
+        "handle",
+        '    if (bad := words.validate_word(match_type, word)) is not None:\n'
+        '        await _reply(add_cmd, title="这条加不了", lines=[bad], tone="error")',
+        "    pass  # MUTATED: 不校验",
+    ),
+    (
+        "M31",
+        "词表条数上限不生效 —— 每条群消息都要过一遍词表，无上限会被堆到很慢",
+        "handle",
+        "    if store.count_words() >= words.MAX_WORDS:",
+        "    if False:  # MUTATED: 不看上限",
+    ),
+    (
+        "M32",
+        "空文本也参与匹配 —— 空消息（/纯图片消息）会命中 `.*` 这类规则",
+        "words",
+        '    if not text:\n        return False\n    if match_type == "contains":',
+        '    if match_type == "contains":',
+    ),
+    (
+        "M33",
+        "多条命中时取**最后**一条 —— 匹配顺序不再等于「先加先生效」，用户看列表也推不出来",
+        "words",
+        "        if match_word(match_type, word, text):\n"
+        '            return Hit(word_id=int(row["id"]), match_type=match_type, word=word)\n'
+        "    return None",
+        "        if match_word(match_type, word, text):\n"
+        '            last = Hit(word_id=int(row["id"]), match_type=match_type, word=word)\n'
+        '    return locals().get("last")',
     ),
 ]
 
