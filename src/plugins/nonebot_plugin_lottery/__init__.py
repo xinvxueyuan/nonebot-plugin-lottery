@@ -85,6 +85,15 @@ def _usage_text() -> str:
     )
 
 
+#: 各管理命令的说明（菜单/详情展示用）。命令词本身来自 `handle.CMD_NAMES`，
+#: 这里不重复写死 —— 以后加命令时只需在这张表里补一条说明。
+_CMD_DESCS: Final[dict[str, str]] = {
+    handle.CMD_ADD: "添加一个匹配词（命中即随机禁言；群管理/超管）",
+    handle.CMD_DEL: "按 id 删除匹配词",
+    handle.CMD_UPDATE: "按 id 更新匹配词",
+    handle.CMD_LIST: "列出当前全部匹配词",
+}
+
 __plugin_meta__ = PluginMetadata(
     name="抽奖",
     description="参与抽奖的群员会被随机禁言一段时间, 我看看谁这么贱",
@@ -99,7 +108,10 @@ __plugin_meta__ = PluginMetadata(
         "upstream": "zhenxun_bot zhenxun/plugins/lottery",
         "version": "2.0",
         "menu_type": "群内小游戏",
-        "commands": [{"command": c} for c in handle.CMD_NAMES],
+        "order": 15,
+        "commands": [
+            {"command": c, "desc": _CMD_DESCS.get(c, "")} for c in handle.CMD_NAMES
+        ],
     },
 )
 
