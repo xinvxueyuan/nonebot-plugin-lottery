@@ -1,6 +1,6 @@
 # nonebot-plugin-lottery
 
-抽奖（**禁言小助手**）—— 参与抽奖的群员会被随机禁言一段时间，我看看谁这么贱。
+抽奖（**禁言小助手**）—— 群里命中「匹配词」的人会被随机禁言一段时间，我看看谁这么贱。
 
 > 抽取自 [zhenxun_bot](https://github.com/HibiKier/zhenxun_bot) 的
 > `zhenxun/plugins/lottery`（原作者 **阿珏酱**），把真寻内部件
@@ -9,9 +9,30 @@
 >
 > **v2.0**：触发词改为**运行时匹配词表**（存 sqlite）+ CRUD 命令 + htmlkit 卡片。
 
-## 用法
+## 功能
 
-**匹配词**存在数据库里、**运行时可变**（用户 2026-10-06 拍板），所以先看一眼/加几条：
+- 群消息命中**运行时匹配词表**里的任一条 → 在 `[MIN, MAX]` 分钟之间随机抽一个数，**禁言发消息的人自己**：
+
+  ```
+  恭喜 阿百川(10001) 参与"自刎归天"！
+  🎉 获得了 480分钟禁言大礼包 🎉
+  ```
+
+- 匹配词**不在代码里、也不在配置里**：存在 sqlite（`lottery_words` 表），群管理/超管可在**运行时**增删改，改词不用重启进程。
+- 匹配对象是 `event.get_plaintext()`（**剥掉图片/at 段后的纯文本**），所以 `[图片]自刎归天` 也会命中。多条都命中时按 **id 升序**取第一条（= 先加先生效）。
+- 抽到的时长**超过阈值**（默认 10 分钟）时，挂一次性任务**到点调 API 解禁**（幂等；同一用户二次抽奖覆盖旧任务）；没超过就让平台自然到期。**禁言时长就是抽到的值，不做封顶**。
+- 待解禁任务**容灾持久化**在 sqlite，bot 重启/被杀后启动时重建（见下文）—— 被抽到 480 分钟的人不会被真关 8 小时。
+- 要求 bot 在该群是管理员，否则回「<命中的词>禁言失败，可能是机器人没有禁言权限」。
+- CRUD 的**所有**回复默认渲染成 [nonebot-plugin-htmlkit](https://pypi.org/project/nonebot-plugin-htmlkit/) 卡片（用户要求），渲染不可用时自动回退纯文本 —— 渲染问题绝不会表现成「命令没反应」。
+
+## 命令
+
+| 命令 | 别名 | 说明 |
+|---|---|---|
+| `增加匹配词 <类型> <词>` | `添加匹配词`、`新增匹配词` | 加一条匹配词，命中即随机禁言 |
+| `删除匹配词 <id> [id ...]` | `移除匹配词` | 按 id 删（可一次多个；空格 / 逗号 / 顿号分隔） |
+| `更新匹配词 <id> <类型> <词>` | `修改匹配词` | 改第 `<id>` 条的类型与内容 |
+| `查看匹配词` | `匹配词列表`、`查看抽奖匹配词` | 列出全部（带 id，按 id 升序 = 匹配顺序） |
 
 ```
 查看匹配词                      列出全部（带 id）
@@ -21,14 +42,8 @@
 删除匹配词 3 5                  按 id 删（可一次多个）
 ```
 
-命中后**禁言发消息的人自己**：
-
-```
-恭喜 阿百川(10001) 参与"自刎归天"！
-🎉 获得了 480分钟禁言大礼包 🎉
-```
-
-要求 bot 在该群是管理员，否则回「<命中的词>禁言失败，可能是机器人没有禁言权限」。
+> ⚠️ 触发抽奖的**不是命令**，而是运行时匹配词 —— 词表里任意一条命中群消息即触发抽奖。
+> 参数里的**词可以含空格**（只按第一个空白切分「类型」与「词」），中文梗常有空格。
 
 ### 匹配类型（对齐 NoneBot 内置规则的语义）
 
@@ -86,6 +101,37 @@ QQ 群禁言的平台边界是**按秒**的：最短 60 秒、最长 2,592,000 �
 换算关系在 `config.py` 里具名成 `QQ_BAN_MIN_SECONDS` / `QQ_BAN_MAX_SECONDS`
 （及对应的 `*_MINUTES`），**不要**在代码里散裸数字：看到 `43200` 没人会
 立刻想到「30 天」，看到 `QQ_BAN_MAX_SECONDS` 会。超出边界的值会被 pydantic 拦下。
+
+## 依赖与安装
+
+- 运行依赖（以 `pyproject.toml` 的 `dependencies` 为准）：`nonebot2 >= 2.5.0`、
+  `nonebot-adapter-onebot >= 2.4.6`、`nonebot-plugin-apscheduler >= 0.5.0`（调度）、
+  `nonebot-plugin-localstore >= 0.7.4`（解禁记录的容灾库放在它的插件数据目录）
+- 可选依赖（extra `htmlkit`）：`nonebot-plugin-htmlkit == 0.1.0rc5`（CRUD 回复渲染成图；缺了回退纯文本）
+- Python：`>= 3.10`
+- 安装（宿主以 git 子模块引入）：
+
+```bash
+git submodule add -b main https://github.com/xinvxueyuan/nonebot-plugin-lottery.git \
+  vendor/nonebot-plugin-lottery
+git -C vendor/nonebot-plugin-lottery checkout <钉定的 SHA>
+```
+
+- 宿主 `[tool.nonebot] plugin_dirs` 加一行 `vendor/nonebot-plugin-lottery/src/plugins`
+  （本仓自带的 `plugin_dirs = ["src/plugins"]` 是插件独立开发时用的）
+
+## 测试与门禁
+
+```bash
+uv run python -m pytest tests/ -q
+uv run ruff check . && uv run ruff format --check .
+uv run pyright
+uv run python scripts/mutation_check.py   # 变异检验：故意写坏行为，看测试是否变红
+```
+
+> 本机 git-bash 里跑要先剔除宿主环境变量（否则 uv 会挑错解释器/venv）：
+> 每条命令前缀 `env -u UV_PYTHON -u UV_PROJECT_ENVIRONMENT -u SSL_CERT_FILE -u VIRTUAL_ENV -u PYTHONPATH`；
+> 首次还要 `env -u ... uv sync --all-groups`。`scripts/mutation_check.py` 自己也是这么调子进程的。
 
 ## 触发词为什么是「运行时」的（以及两个坑）
 
@@ -162,38 +208,9 @@ ref_to_obj("vendor.nonebot-plugin-lottery.src.plugins.nonebot_plugin_lottery:_un
 也就是说**即使 jobstore 写成功了，重启后也一定恢复不回来** —— 那种「持久化」
 只会给人一种已经安全了的错觉。故采用「自建表 + 启动重建」，零新依赖、行为可测。
 
-## 依赖
+## 许可
 
-- `nonebot2 >= 2.5`
-- `nonebot-adapter-onebot >= 2.4.6`
-- `nonebot-plugin-apscheduler >= 0.5`（调度）
-- `nonebot-plugin-localstore >= 0.7.4`（数据目录）
-- （可选）`nonebot-plugin-htmlkit == 0.1.0rc5`（CRUD 回复渲染成图；缺了回退纯文本）
+本仓库**未附加**开源许可证，默认**保留所有权利**（All rights reserved）。如需复用请联系作者。
 
-## 安装（宿主以 git 子模块引入）
-
-```bash
-git submodule add -b main https://github.com/xinvxueyuan/nonebot-plugin-lottery.git \
-  vendor/nonebot-plugin-lottery
-git -C vendor/nonebot-plugin-lottery checkout <钉定的 SHA>
-```
-
-宿主 `pyproject.toml`：
-
-```toml
-[tool.nonebot]
-plugin_dirs = ["vendor/nonebot-plugin-lottery/src/plugins"]
-```
-
-## 开发
-
-```bash
-env -u UV_PYTHON -u UV_PROJECT_ENVIRONMENT -u SSL_CERT_FILE -u VIRTUAL_ENV -u PYTHONPATH uv sync --all-groups
-env -u UV_PYTHON -u UV_PROJECT_ENVIRONMENT -u SSL_CERT_FILE -u VIRTUAL_ENV -u PYTHONPATH uv run pytest tests/ -q
-env -u UV_PYTHON -u UV_PROJECT_ENVIRONMENT -u SSL_CERT_FILE -u VIRTUAL_ENV -u PYTHONPATH uv run ruff check src/ tests/
-env -u UV_PYTHON -u UV_PROJECT_ENVIRONMENT -u SSL_CERT_FILE -u VIRTUAL_ENV -u PYTHONPATH uv run pyright src/
-```
-
-## License
-
-MIT（沿用上游项目的许可）。
+> 说明：`pyproject.toml` 的 `license` 字段标为 MIT（沿用上游抽取来源 zhenxun_bot 的
+> `lottery` 插件的许可声明），但仓库根目录没有 `LICENSE` 文件。
